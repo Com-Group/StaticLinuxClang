@@ -4,12 +4,12 @@ on:
   workflow_dispatch:
     inputs:
       llvm_version:
-        description: 'LLVM 版本号'
+        description: 'LLVM 完整版本号（例如 20.1.8）'
         required: true
-        default: '20'
+        default: '20.1.8'
 
 env:
-  LLVM_VERSION: ${{ github.event.inputs.llvm_version }}
+  LLVM_FULL: ${{ github.event.inputs.llvm_version }}
 
 jobs:
   build:
@@ -41,9 +41,9 @@ jobs:
           path: |
             llvm-project
             llvm-build-cache
-          key: llvm-${{ env.LLVM_VERSION }}-${{ matrix.target }}-${{ matrix.arch }}-clang-libcxx
+          key: llvm-${{ env.LLVM_FULL }}-${{ matrix.target }}-${{ matrix.arch }}-clang-libcxx
           restore-keys: |
-            llvm-${{ env.LLVM_VERSION }}-${{ matrix.target }}-${{ matrix.arch }}-clang-libcxx-
+            llvm-${{ env.LLVM_FULL }}-${{ matrix.target }}-${{ matrix.arch }}-clang-libcxx-
 
       # ====================================================
       # 1. Linux 编译（Alpine + Clang 自举 + 静态 libc++）
@@ -64,36 +64,39 @@ jobs:
           $DOCKER_CMD alpine:3.20 sh -c "
             set -e
             apk update
-            # 安装构建工具，并安装 clang 作为引导编译器
             apk add --no-cache alpine-sdk cmake ninja git python3 \
               clang clang-dev lld musl-dev zlib-dev libxml2-dev ncurses-dev \
               zlib-static libxml2-static ncurses-static
 
-            # 处理源码（缓存复用）
+            MAJOR=\$(echo '${{ env.LLVM_FULL }}' | cut -d. -f1)
+
+            cd /workspace
             if [ -d llvm-project ]; then
               echo '使用缓存的 LLVM 源码'
               cd llvm-project
+              git fetch --depth 1 origin release/\${MAJOR}.x
+              git checkout release/\${MAJOR}.x
               git submodule update --init --depth 1 clang cmake compiler-rt libcxx libcxxabi lld clang-tools-extra
             else
               echo '克隆 LLVM 源码'
-              git clone --depth 1 --branch release/${{ env.LLVM_VERSION }}.x https://github.com/llvm/llvm-project.git
+              git clone --depth 1 --branch release/\${MAJOR}.x https://github.com/llvm/llvm-project.git
               cd llvm-project
               git submodule update --init --depth 1 clang cmake compiler-rt libcxx libcxxabi lld clang-tools-extra
             fi
 
+            rm -rf /workspace/llvm-build-cache
             mkdir -p /workspace/llvm-build-cache
             cd /workspace/llvm-build-cache
 
-            # 使用 clang 作为编译器
             export CC=clang
             export CXX=clang++
 
-            # 配置 CMake，启用静态 libc++ 并静态链接到 clang 可执行文件
             cmake -G Ninja /workspace/llvm-project/llvm \
               -DCMAKE_BUILD_TYPE=Release \
               -DCMAKE_C_COMPILER=clang \
               -DCMAKE_CXX_COMPILER=clang++ \
               -DCMAKE_SYSTEM_NAME=Linux \
+              -DCMAKE_SYSTEM_PROCESSOR=${{ matrix.arch }} \
               -DCMAKE_C_COMPILER_TARGET=${{ matrix.triple }} \
               -DCMAKE_CXX_COMPILER_TARGET=${{ matrix.triple }} \
               -DCMAKE_EXE_LINKER_FLAGS='-static -static-libgcc' \
@@ -113,67 +116,67 @@ jobs:
               -DLLVM_INCLUDE_BENCHMARKS=OFF \
               -DLLVM_ENABLE_TERMINFO=OFF \
               -DCLANG_TOOL_CLANG_TIDY_BUILD=ON \
-              -DCLANG_TOOL_CLANG_FORMAT_BUILD=ON
+              -DCLANG_TOOL_CLANG_FORMAT_BUILD=ON \
+              -DLLVM_DEFAULT_TARGET_TRIPLE=${{ matrix.triple }} \
+              -DLLVM_HOST_TRIPLE=${{ matrix.triple }} \
+              -DLLVM_RUNTIME_TARGETS=${{ matrix.triple }}
 
-            # 限制并行数（QEMU 环境降低负载）
-            if [ "${{ matrix.use_qemu }}" = "true" ]; then
+            if [ '${{ matrix.use_qemu }}' = 'true' ]; then
               ninja -j2
             else
               ninja -j\$(nproc)
             fi
 
-            # 创建打包目录
             mkdir -p /workspace/static-clang/bin
             mkdir -p /workspace/static-clang/include
             mkdir -p /workspace/static-clang/lib
 
-            # 复制可执行文件
             cp bin/clang /workspace/static-clang/bin/
             cp bin/clang++ /workspace/static-clang/bin/
             cp bin/lld /workspace/static-clang/bin/
             cp bin/clang-tidy /workspace/static-clang/bin/
             cp bin/clang-format /workspace/static-clang/bin/
 
-            # 复制 libc++ 头文件
             cp -r /workspace/llvm-project/libcxx/include /workspace/static-clang/include/libcxx
             cp -r /workspace/llvm-project/libcxxabi/include /workspace/static-clang/include/libcxxabi
 
-            # 复制静态库（路径可能因版本而异）
             find . -name 'libc++.a' -exec cp {} /workspace/static-clang/lib/ \;
             find . -name 'libc++abi.a' -exec cp {} /workspace/static-clang/lib/ \;
           "
 
       # ====================================================
       # 2. macOS 编译（Apple Clang 引导 + 静态 libc++）
-      #    修复：显式指定链接器为默认（避免 -fuse-ld=lld 报错）
       # ====================================================
       - name: 编译静态 Clang 并打包 libc++ (macOS)
         if: matrix.target_os == 'macos'
         run: |
           cd ${{ github.workspace }}
 
+          MAJOR=$(echo '${{ env.LLVM_FULL }}' | cut -d. -f1)
+
           if [ -d llvm-project ]; then
             echo '使用缓存的 LLVM 源码'
             cd llvm-project
+            git fetch --depth 1 origin release/${MAJOR}.x
+            git checkout release/${MAJOR}.x
             git submodule update --init --depth 1 clang cmake compiler-rt libcxx libcxxabi lld clang-tools-extra
           else
             echo '克隆 LLVM 源码'
-            git clone --depth 1 --branch release/${{ env.LLVM_VERSION }}.x https://github.com/llvm/llvm-project.git
+            git clone --depth 1 --branch release/${MAJOR}.x https://github.com/llvm/llvm-project.git
             cd llvm-project
             git submodule update --init --depth 1 clang cmake compiler-rt libcxx libcxxabi lld clang-tools-extra
           fi
 
           cd ${{ github.workspace }}
+          rm -rf llvm-build-cache
           mkdir -p llvm-build-cache
           cd llvm-build-cache
 
-          # 使用系统 Apple Clang，且链接器显式指定为默认（ld64）
           cmake -G Ninja ../llvm-project/llvm \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_COMPILER=clang \
             -DCMAKE_CXX_COMPILER=clang++ \
             -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 \
-            -DLLVM_USE_LINKER=default \
             -DLLVM_ENABLE_PROJECTS='clang;lld;clang-tools-extra' \
             -DLLVM_ENABLE_RUNTIMES='libcxx;libcxxabi;compiler-rt' \
             -DLLVM_ENABLE_LIBCXX=ON \
@@ -190,7 +193,10 @@ jobs:
             -DLLVM_INCLUDE_BENCHMARKS=OFF \
             -DLLVM_ENABLE_TERMINFO=OFF \
             -DCLANG_TOOL_CLANG_TIDY_BUILD=ON \
-            -DCLANG_TOOL_CLANG_FORMAT_BUILD=ON
+            -DCLANG_TOOL_CLANG_FORMAT_BUILD=ON \
+            -DLLVM_DEFAULT_TARGET_TRIPLE=${{ matrix.triple }} \
+            -DLLVM_HOST_TRIPLE=${{ matrix.triple }} \
+            -DLLVM_RUNTIME_TARGETS=${{ matrix.triple }}
 
           ninja clang lld clang-tidy clang-format
 
@@ -202,11 +208,9 @@ jobs:
           cp bin/clang-tidy ../static-clang/bin/
           cp bin/clang-format ../static-clang/bin/
 
-          # 复制头文件
           cp -r ../llvm-project/libcxx/include ../static-clang/include/libcxx
           cp -r ../llvm-project/libcxxabi/include ../static-clang/include/libcxxabi
 
-          # 复制静态库
           find . -name 'libc++.a' -exec cp {} ../static-clang/lib/ \;
           find . -name 'libc++abi.a' -exec cp {} ../static-clang/lib/ \;
 
@@ -217,16 +221,33 @@ jobs:
         if: matrix.target_os == 'windows'
         shell: pwsh
         run: |
-          $version = "${{ env.LLVM_VERSION }}"
-          $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$version/clang+llvm-$version-x86_64-pc-windows-msvc.tar.xz"
+          $full = "${{ env.LLVM_FULL }}"
+          $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$full/clang+llvm-$full-x86_64-pc-windows-msvc.tar.xz"
           Write-Host "Downloading $url"
-          Invoke-WebRequest -Uri $url -OutFile llvm.tar.xz
+          $attempts = 0
+          do {
+            try {
+              Invoke-WebRequest -Uri $url -OutFile llvm.tar.xz -UserAgent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+              break
+            } catch {
+              $attempts++
+              if ($attempts -ge 3) { throw }
+              Write-Host "下载失败，重试 $attempts ..."
+              Start-Sleep -Seconds 5
+            }
+          } while ($true)
+
           tar -xvf llvm.tar.xz
-          $dir = Get-ChildItem -Directory -Filter "clang+llvm-*" | Select-Object -First 1
+          $dir = Get-ChildItem -Directory | Where-Object { $_.Name -like "clang+llvm-$full*" } | Select-Object -First 1
+          if (-not $dir) {
+            $dir = Get-ChildItem -Directory -Filter "clang+llvm-*" | Select-Object -First 1
+          }
+          if (-not $dir) {
+            throw "未找到解压后的目录"
+          }
           Rename-Item -Path $dir.FullName -NewName "llvm-install"
           $binPath = "$(Get-Location)\llvm-install\bin"
           Add-Content $env:GITHUB_PATH $binPath
-          # 设置环境变量以便 CMake 找到 clang
           echo "CC=clang" | Out-File -FilePath $env:GITHUB_ENV -Append
           echo "CXX=clang++" | Out-File -FilePath $env:GITHUB_ENV -Append
 
@@ -241,22 +262,26 @@ jobs:
           WORKSPACE="$(cygpath -u "${{ github.workspace }}")"
           cd "$WORKSPACE"
 
+          MAJOR=$(echo '${{ env.LLVM_FULL }}' | cut -d. -f1)
+
           if [ -d llvm-project ]; then
             echo '使用缓存的 LLVM 源码'
             cd llvm-project
+            git fetch --depth 1 origin release/${MAJOR}.x
+            git checkout release/${MAJOR}.x
             git submodule update --init --depth 1 clang cmake compiler-rt libcxx libcxxabi lld clang-tools-extra
           else
             echo '克隆 LLVM 源码'
-            git clone --depth 1 --branch release/${{ env.LLVM_VERSION }}.x https://github.com/llvm/llvm-project.git
+            git clone --depth 1 --branch release/${MAJOR}.x https://github.com/llvm/llvm-project.git
             cd llvm-project
             git submodule update --init --depth 1 clang cmake compiler-rt libcxx libcxxabi lld clang-tools-extra
           fi
 
           cd "$WORKSPACE"
+          rm -rf llvm-build-cache
           mkdir -p llvm-build-cache
           cd llvm-build-cache
 
-          # 使用原生 clang，并指定目标三元组
           cmake -G Ninja ../llvm-project/llvm \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_COMPILER=clang \
@@ -281,7 +306,9 @@ jobs:
             -DLLVM_ENABLE_TERMINFO=OFF \
             -DCLANG_TOOL_CLANG_TIDY_BUILD=ON \
             -DCLANG_TOOL_CLANG_FORMAT_BUILD=ON \
-            -DLLVM_DEFAULT_TARGET_TRIPLE=${{ matrix.triple }}
+            -DLLVM_DEFAULT_TARGET_TRIPLE=${{ matrix.triple }} \
+            -DLLVM_HOST_TRIPLE=${{ matrix.triple }} \
+            -DLLVM_RUNTIME_TARGETS=${{ matrix.triple }}
 
           NPROC=$(nproc 2>/dev/null || echo 4)
           ninja -j$NPROC
@@ -294,11 +321,9 @@ jobs:
           cp bin/clang-tidy.exe ../static-clang/bin/
           cp bin/clang-format.exe ../static-clang/bin/
 
-          # 复制 libc++ 头文件
           cp -r ../llvm-project/libcxx/include ../static-clang/include/libcxx
           cp -r ../llvm-project/libcxxabi/include ../static-clang/include/libcxxabi
 
-          # 复制静态库
           find . -name 'libc++.lib' -exec cp {} ../static-clang/lib/ \;
           find . -name 'libc++abi.lib' -exec cp {} ../static-clang/lib/ \;
 
@@ -336,7 +361,7 @@ jobs:
           if git diff --staged --quiet; then
             echo "无变化，跳过提交"
           else
-            git commit -m "[skip ci] 更新 Clang ${{ env.LLVM_VERSION }} - ${{ matrix.target }}（统一Clang + libc++）"
+            git commit -m "[skip ci] 更新 Clang ${{ env.LLVM_FULL }} - ${{ matrix.target }}（统一Clang + libc++）"
             git push
           fi
 
