@@ -35,7 +35,7 @@ jobs:
     steps:
       # ---------- 全局缓存（配置变更后缓存自动失效） ----------
       - name: 缓存 LLVM 源码与构建
-        uses: actions/cache@v3
+        uses: actions/cache@v5               # 升级到 v5 以支持 Node.js 24
         id: cache-llvm
         with:
           path: |
@@ -61,12 +61,14 @@ jobs:
             DOCKER_CMD="$DOCKER_CMD --platform linux/${{ matrix.arch }}"
           fi
 
-          $DOCKER_CMD alpine:latest sh -c "
+          # 使用固定版本 alpine:3.20 避免包名变动，并移除不存在的 libatomic-static
+          $DOCKER_CMD alpine:3.20 sh -c "
             set -e
             apk update
             apk add --no-cache alpine-sdk cmake ninja clang lld git python3 \
               musl-dev zlib-dev libxml2-dev ncurses-dev
-            apk add --no-cache zlib-static libxml2-static ncurses-static libatomic-static
+            apk add --no-cache zlib-static libxml2-static ncurses-static
+            # 注：libatomic-static 在 Alpine 仓库中不存在，已移除
 
             if [ -d llvm-project ]; then
               echo '使用缓存的 LLVM 源码'
@@ -174,8 +176,8 @@ jobs:
       - name: 设置 MSVC 环境 (Windows)
         if: matrix.target_os == 'windows'
         uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: x64
+        # 注：该 Action 目前尚未更新以支持 Node.js 24，但暂时可正常工作
+        # 关注 https://github.com/ilammy/msvc-dev-cmd 获取更新
 
       - name: 编译静态链接 CRT 的 Clang (Windows)
         if: matrix.target_os == 'windows'
@@ -232,8 +234,8 @@ jobs:
       - name: 拉取 StaticClangPool 仓库（Majority 分支）
         uses: actions/checkout@v4
         with:
-          repository: Com-Group/StaticClangPool
-          ref: Majority
+          repository: Com-Group/StaticClangPool   # ⚠️ 请修改为你的目标仓库
+          ref: Majority                           # ⚠️ 请修改为你的目标分支
           token: ${{ secrets.REPO_ACCESS_TOKEN }}
           lfs: true
 
