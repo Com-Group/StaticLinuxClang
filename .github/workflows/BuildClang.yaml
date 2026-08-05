@@ -1,4 +1,4 @@
-name: 编译Clang多平台
+name: 编译Clang多平台（高度静态化）
 
 on:
   workflow_dispatch:
@@ -15,24 +15,25 @@ jobs:
   build:
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 360
     strategy:
       fail-fast: false
       matrix:
         include:
-          # ========== Linux 静态构建 (保留原有逻辑) ==========
-          - { target: linux-x86_64, runner: ubuntu-22.04, arch: x86_64, triple: x86_64-alpine-linux-musl, target_os: linux }
-          - { target: linux-aarch64, runner: ubuntu-22.04-arm, arch: aarch64, triple: aarch64-alpine-linux-musl, target_os: linux }
-          - { target: linux-riscv64, runner: ubuntu-22.04-riscv, arch: riscv64, triple: riscv64-alpine-linux-musl, target_os: linux }
+          # ========== Linux 静态构建（全静态，musl） ==========
+          - { target: linux-x86_64, runner: ubuntu-22.04, arch: x86_64, triple: x86_64-alpine-linux-musl, target_os: linux, use_qemu: false }
+          - { target: linux-aarch64, runner: ubuntu-22.04-arm, arch: aarch64, triple: aarch64-alpine-linux-musl, target_os: linux, use_qemu: false }
+          - { target: linux-riscv64, runner: ubuntu-22.04, arch: riscv64, triple: riscv64-alpine-linux-musl, target_os: linux, use_qemu: true }
 
-          # ========== macOS 动态构建 (新增) ==========
+          # ========== macOS 高度静态化（Bootstrap + 静态 libc++） ==========
           - { target: macos-x86_64, runner: macos-13, arch: x86_64, triple: x86_64-apple-darwin, target_os: macos }
           - { target: macos-arm64, runner: macos-14, arch: arm64, triple: arm64-apple-darwin, target_os: macos }
 
-          # ========== Windows 动态构建 (新增) ==========
+          # ========== Windows 完全静态（静态 CRT /MT） ==========
           - { target: windows-x86_64, runner: windows-2022, arch: x86_64, triple: x86_64-pc-windows-msvc, target_os: windows }
 
     steps:
-      # ---------- 全局缓存（适用于所有平台） ----------
+      # ---------- 全局缓存（配置变更后缓存自动失效） ----------
       - name: 缓存 LLVM 源码与构建
         uses: actions/cache@v3
         id: cache-llvm
@@ -40,26 +41,28 @@ jobs:
           path: |
             llvm-project
             llvm-build-cache
-          # 修复点：去掉 github.sha，用 target 区分不同平台缓存
-          key: llvm-${{ env.LLVM_VERSION }}-${{ matrix.target }}
+          key: llvm-${{ env.LLVM_VERSION }}-${{ matrix.target }}-static
           restore-keys: |
-            llvm-${{ env.LLVM_VERSION }}-${{ matrix.target }}-
+            llvm-${{ env.LLVM_VERSION }}-${{ matrix.target }}-static-
 
       # ====================================================
-      # 1. Linux 编译（全静态，Alpine 容器内进行）
+      # 1. Linux 编译（全静态，Alpine 容器内）
       # ====================================================
-      - name: 安装 Docker（Linux 宿主机）
-        if: matrix.target_os == 'linux'
-        run: |
-          sudo apt update && sudo apt install -y docker.io
-          sudo systemctl start docker
-
       - name: 编译静态 Clang (Linux)
         if: matrix.target_os == 'linux'
         run: |
-          docker run --rm -v $(pwd):/workspace -w /workspace alpine:latest sh -c "
-            set -e
+          if [ "${{ matrix.use_qemu }}" = "true" ]; then
+            sudo apt-get update
+            sudo apt-get install -y qemu-user-static binfmt-support
+          fi
 
+          DOCKER_CMD="docker run --rm -v $(pwd):/workspace -w /workspace"
+          if [ "${{ matrix.use_qemu }}" = "true" ]; then
+            DOCKER_CMD="$DOCKER_CMD --platform linux/${{ matrix.arch }}"
+          fi
+
+          $DOCKER_CMD alpine:latest sh -c "
+            set -e
             apk update
             apk add --no-cache alpine-sdk cmake ninja clang lld git python3 \
               musl-dev zlib-dev libxml2-dev ncurses-dev
@@ -103,7 +106,11 @@ jobs:
               -DCLANG_TOOL_SCAN_VIEW_BUILD=OFF \
               -DCLANG_TOOL_SCAN_BUILD_BUILD=OFF
 
-            ninja -j\$(nproc)
+            if [ "${{ matrix.use_qemu }}" = "true" ]; then
+              ninja -j2
+            else
+              ninja -j\$(nproc)
+            fi
 
             mkdir -p /workspace/static-clang/bin
             cp bin/clang /workspace/static-clang/bin/
@@ -114,15 +121,13 @@ jobs:
           "
 
       # ====================================================
-      # 2. macOS 编译（动态链接，不使用 static 标志）
+      # 2. macOS 编译（Bootstrap 两阶段，第二阶段静态链接 libc++）
       # ====================================================
-      - name: 编译 Clang (macOS)
+      - name: 编译高度静态 Clang (macOS)
         if: matrix.target_os == 'macos'
         run: |
-          # 进入工作目录
           cd ${{ github.workspace }}
 
-          # 准备源码
           if [ -d llvm-project ]; then
             echo '使用缓存的 LLVM 源码'
             cd llvm-project
@@ -138,33 +143,33 @@ jobs:
           mkdir -p llvm-build-cache
           cd llvm-build-cache
 
-          # macOS 编译：不添加 -static，使用系统默认动态链接
+          # 启用 Bootstrap 构建，并将静态化参数传递给 Stage2
           cmake -G Ninja ../llvm-project/llvm \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_C_COMPILER=clang \
-            -DCMAKE_CXX_COMPILER=clang++ \
-            -DLLVM_ENABLE_PIC=ON \
-            -DBUILD_SHARED_LIBS=OFF \
+            -DCLANG_ENABLE_BOOTSTRAP=ON \
+            -DCLANG_BOOTSTRAP_CMAKE_ARGS="-DLLVM_ENABLE_LIBCXX=ON -DLLVM_STATIC_LINK_CXX_STDLIB=ON -DLIBCXX_STATICALLY_LINK_ABI_IN_STATIC_LIBRARY=ON -DLLVM_ENABLE_LLD=ON -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0" \
             -DLLVM_ENABLE_PROJECTS='clang;lld;clang-tools-extra' \
             -DLLVM_ENABLE_RUNTIMES='libcxx;libcxxabi;compiler-rt' \
             -DLLVM_INCLUDE_TESTS=OFF \
             -DLLVM_INCLUDE_EXAMPLES=OFF \
             -DLLVM_INCLUDE_BENCHMARKS=OFF \
-            -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 \
+            -DLLVM_ENABLE_TERMINFO=OFF \
             -DCLANG_TOOL_CLANG_TIDY_BUILD=ON \
             -DCLANG_TOOL_CLANG_FORMAT_BUILD=ON
 
-          ninja -j$(sysctl -n hw.ncpu)
+          # 构建 Stage2（bootstrap 的最终产物）
+          ninja stage2
 
+          # 从 Stage2 的 bin 目录复制二进制文件
           mkdir -p ../static-clang/bin
-          cp bin/clang ../static-clang/bin/
-          cp bin/clang++ ../static-clang/bin/
-          cp bin/lld ../static-clang/bin/
-          cp bin/clang-tidy ../static-clang/bin/
-          cp bin/clang-format ../static-clang/bin/
+          cp stage2/bin/clang ../static-clang/bin/
+          cp stage2/bin/clang++ ../static-clang/bin/
+          cp stage2/bin/lld ../static-clang/bin/
+          cp stage2/bin/clang-tidy ../static-clang/bin/
+          cp stage2/bin/clang-format ../static-clang/bin/
 
       # ====================================================
-      # 3. Windows 编译（动态链接 MSVC 运行时）
+      # 3. Windows 编译（静态链接 MSVC CRT /MT）
       # ====================================================
       - name: 设置 MSVC 环境 (Windows)
         if: matrix.target_os == 'windows'
@@ -172,17 +177,15 @@ jobs:
         with:
           arch: x64
 
-      - name: 编译 Clang (Windows)
+      - name: 编译静态链接 CRT 的 Clang (Windows)
         if: matrix.target_os == 'windows'
         shell: bash
         run: |
           cd ${{ github.workspace }}
 
-          # 准备源码
           if [ -d llvm-project ]; then
             echo '使用缓存的 LLVM 源码'
             cd llvm-project
-            # Windows 下不需要 compiler-rt 和 libcxx（使用 MSVC 标准库），仅拉取必要项目
             git submodule update --init --depth 1 clang cmake lld clang-tools-extra
           else
             echo '克隆 LLVM 源码'
@@ -195,17 +198,18 @@ jobs:
           mkdir -p llvm-build-cache
           cd llvm-build-cache
 
-          # Windows 编译：使用 MSVC cl.exe 编译，动态链接 /MD（默认）
           cmake -G Ninja ../llvm-project/llvm \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_COMPILER=cl \
             -DCMAKE_CXX_COMPILER=cl \
-            -DLLVM_ENABLE_PIC=ON \
+            -DCMAKE_MSVC_RUNTIME_LIBRARY="MultiThreaded" \
+            -DLLVM_ENABLE_PIC=OFF \
             -DBUILD_SHARED_LIBS=OFF \
             -DLLVM_ENABLE_PROJECTS='clang;lld;clang-tools-extra' \
             -DLLVM_INCLUDE_TESTS=OFF \
             -DLLVM_INCLUDE_EXAMPLES=OFF \
             -DLLVM_INCLUDE_BENCHMARKS=OFF \
+            -DLLVM_ENABLE_TERMINFO=OFF \
             -DCLANG_TOOL_CLANG_TIDY_BUILD=ON \
             -DCLANG_TOOL_CLANG_FORMAT_BUILD=ON \
             -DLLVM_DEFAULT_TARGET_TRIPLE=x86_64-pc-windows-msvc
@@ -220,7 +224,7 @@ jobs:
           cp bin/clang-format.exe ../static-clang/bin/
 
       # ====================================================
-      # 4. 通用打包 & 部署（所有平台统一处理）
+      # 4. 通用打包 & 部署
       # ====================================================
       - name: 打包二进制文件
         run: tar -czf clang-${{ matrix.target }}.tar.gz -C static-clang .
@@ -232,7 +236,6 @@ jobs:
           ref: Majority
           token: ${{ secrets.REPO_ACCESS_TOKEN }}
           lfs: true
-          path: deploy-repo
 
       - name: 解压并提交（按 target 目录存放）
         run: |
@@ -241,7 +244,6 @@ jobs:
           tar -xzf ../clang-${{ matrix.target }}.tar.gz -C Clang/${{ matrix.target }}
           
           git lfs install
-          # 修复 LFS 匹配规则：匹配所有子目录下的 clang* 和 *.exe
           git lfs track "Clang/**/clang*" "Clang/**/*.exe"
           
           git add Clang/ .gitattributes
@@ -251,6 +253,6 @@ jobs:
           if git diff --staged --quiet; then
             echo "无变化，跳过提交"
           else
-            git commit -m "[skip ci] 更新 Clang ${{ env.LLVM_VERSION }} - ${{ matrix.target }}"
+            git commit -m "[skip ci] 更新 Clang ${{ env.LLVM_VERSION }} - ${{ matrix.target }}（高度静态化）"
             git push
           fi
