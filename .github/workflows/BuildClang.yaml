@@ -20,16 +20,19 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Linux 平台（使用 Alpine + musl，Clang 自举）
-          - { target: linux-x86_64, runner: ubuntu-22.04, arch: x86_64, triple: x86_64-alpine-linux-musl, target_os: linux, use_qemu: false }
-          - { target: linux-aarch64, runner: ubuntu-22.04-arm, arch: aarch64, triple: aarch64-alpine-linux-musl, target_os: linux, use_qemu: false }
-          - { target: linux-riscv64, runner: ubuntu-22.04, arch: riscv64, triple: riscv64-alpine-linux-musl, target_os: linux, use_qemu: true }
+          # Linux x86_64（Alpine 容器，Clang 自举）
+          - { target: linux-x86_64, runner: ubuntu-22.04, arch: x86_64, triple: x86_64-alpine-linux-musl, target_os: linux }
+          # Linux AArch64（Alpine 容器，Clang 自举）
+          - { target: linux-aarch64, runner: ubuntu-22.04-arm, arch: aarch64, triple: aarch64-alpine-linux-musl, target_os: linux }
+          # Linux RISC-V 64（使用 RISE 原生 RISC-V Runner，无需 QEMU）
+          - { target: linux-riscv64, runner: ubuntu-24.04-riscv, arch: riscv64, triple: riscv64-alpine-linux-musl, target_os: linux }
 
-          # macOS 平台（使用 Apple Clang 作为引导编译器）
+          # macOS x86_64（使用 Apple Clang）
           - { target: macos-x86_64, runner: macos-13, arch: x86_64, triple: x86_64-apple-darwin, target_os: macos }
+          # macOS ARM64（使用 Apple Clang）
           - { target: macos-arm64, runner: macos-14, arch: arm64, triple: arm64-apple-darwin, target_os: macos }
 
-          # Windows 平台（使用原生 Clang 引导 + libc++）
+          # Windows（使用预编译 Clang 引导）
           - { target: windows-x86_64, runner: windows-2022, arch: x86_64, triple: x86_64-pc-windows-msvc, target_os: windows }
 
     steps:
@@ -51,16 +54,11 @@ jobs:
       - name: 编译静态 Clang 并打包 libc++ (Linux)
         if: matrix.target_os == 'linux'
         run: |
-          if [ "${{ matrix.use_qemu }}" = "true" ]; then
-            sudo apt-get update
-            sudo apt-get install -y qemu-user-static binfmt-support
-          fi
-
+          # RISC-V 原生 Runner 上无需 QEMU，直接运行 Alpine 容器
           DOCKER_CMD="docker run --rm -v $(pwd):/workspace -w /workspace"
-          if [ "${{ matrix.use_qemu }}" = "true" ]; then
-            DOCKER_CMD="$DOCKER_CMD --platform linux/${{ matrix.arch }}"
-          fi
 
+          # 注意：RISC-V 原生 Runner 是 riscv64 架构，可以直接运行 riscv64 容器
+          # 但 Alpine 官方提供 riscv64 镜像，直接使用即可
           $DOCKER_CMD alpine:3.20 sh -c "
             set -e
             apk update
@@ -123,11 +121,8 @@ jobs:
               -DLLVM_HOST_TRIPLE=${{ matrix.triple }} \
               -DLLVM_RUNTIME_TARGETS=${{ matrix.triple }}
 
-            if [ '${{ matrix.use_qemu }}' = 'true' ]; then
-              ninja -j2
-            else
-              ninja -j\$(nproc)
-            fi
+            # 原生 Runner 使用全部 CPU 核心
+            ninja -j\$(nproc)
 
             mkdir -p /workspace/static-clang/bin
             mkdir -p /workspace/static-clang/include
@@ -383,18 +378,12 @@ jobs:
           mkdir -p Clang/${{ matrix.target }}
           tar -xzf ../clang-${{ matrix.target }}.tar.gz -C Clang/${{ matrix.target }}
 
-          # 确保 LFS 已安装并配置
           git lfs install
-
-          # 在添加文件之前，先确保 .gitattributes 中有 LFS 规则
-          # 这样新添加的大文件会直接进入 LFS
           git lfs track "*.exe" "*.a" "*.lib" "*.dll" "*.so" "*.dylib"
 
-          # 添加所有文件
           git add Clang/ .gitattributes
 
-          # 检查是否有大文件在普通 Git 对象中（历史遗留问题）
-          # 如果有，使用 migrate 将其迁移到 LFS
+          # 如果历史中有大文件，迁移到 LFS
           if git lfs migrate info --include="*.exe,*.a,*.lib,*.dll,*.so,*.dylib" 2>/dev/null | grep -q "objects"; then
             echo "检测到历史中的大文件，正在迁移到 LFS..."
             git lfs migrate import --include="*.exe,*.a,*.lib,*.dll,*.so,*.dylib" --everything --verbose
@@ -407,7 +396,6 @@ jobs:
             echo "无变化，跳过提交"
           else
             git commit -m "[skip ci] 更新 Clang ${{ env.LLVM_FULL }} - ${{ matrix.target }}（统一Clang + libc++）"
-            # 使用 --force 推送，因为 migrate 会重写历史
             git push --force
           fi
 
