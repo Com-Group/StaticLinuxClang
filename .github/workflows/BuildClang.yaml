@@ -74,7 +74,6 @@ jobs:
             if [ -d llvm-project ]; then
               echo '使用缓存的 LLVM 源码'
               cd llvm-project
-              # 更新 remote URL 以使用代理
               git remote set-url origin https://gh-proxy.org/https://github.com/llvm/llvm-project.git
               git fetch --depth 1 origin release/\${MAJOR}.x
               git checkout release/\${MAJOR}.x
@@ -113,6 +112,7 @@ jobs:
               -DLIBCXX_ENABLE_SHARED=OFF \
               -DLIBCXXABI_ENABLE_STATIC=ON \
               -DLIBCXXABI_ENABLE_SHARED=OFF \
+              -DLIBCXXABI_USE_LLVM_UNWINDER=OFF \
               -DLLVM_INCLUDE_TESTS=OFF \
               -DLLVM_INCLUDE_EXAMPLES=OFF \
               -DLLVM_INCLUDE_BENCHMARKS=OFF \
@@ -226,20 +226,47 @@ jobs:
         shell: pwsh
         run: |
           $full = "${{ env.LLVM_FULL }}"
-          $url = "https://gh-proxy.org/https://github.com/llvm/llvm-project/releases/download/llvmorg-$full/clang+llvm-$full-x86_64-pc-windows-msvc.tar.xz"
+          $proxy = "https://ghproxy.net/"
+          $url = "$proxy/https://github.com/llvm/llvm-project/releases/download/llvmorg-$full/clang+llvm-$full-x86_64-pc-windows-msvc.tar.xz"
           Write-Host "Downloading $url"
+
+          if (-not (Get-Command aria2c -ErrorAction SilentlyContinue)) {
+            Write-Host "aria2c 未安装，正在通过 Chocolatey 安装..."
+            choco install aria2 -y --limit-output
+            $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+            if (-not (Get-Command aria2c -ErrorAction SilentlyContinue)) {
+              Write-Warning "aria2c 安装失败，将使用 Invoke-WebRequest 下载"
+              $useAria2 = $false
+            } else {
+              $useAria2 = $true
+            }
+          } else {
+            $useAria2 = $true
+          }
+
           $attempts = 0
           do {
             try {
-              Invoke-WebRequest -Uri $url -OutFile llvm.tar.xz -UserAgent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+              if ($useAria2) {
+                Write-Host "使用 aria2c 多线程下载 (16线程)"
+                aria2c -x 16 -s 16 -k 1M --allow-overwrite=true --out=llvm.tar.xz $url
+              } else {
+                Write-Host "使用 Invoke-WebRequest 下载"
+                Invoke-WebRequest -Uri $url -OutFile llvm.tar.xz -UserAgent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+              }
               break
             } catch {
               $attempts++
-              if ($attempts -ge 3) { throw }
+              if ($attempts -ge 3) { throw "下载失败，重试已达上限" }
               Write-Host "下载失败，重试 $attempts ..."
               Start-Sleep -Seconds 5
             }
           } while ($true)
+
+          if (-not (Test-Path llvm.tar.xz) -or (Get-Item llvm.tar.xz).Length -eq 0) {
+            throw "下载的文件无效或为空"
+          }
+          Write-Host "下载完成，文件大小: $(Get-Item llvm.tar.xz).Length 字节"
 
           tar -xvf llvm.tar.xz
           $dir = Get-ChildItem -Directory | Where-Object { $_.Name -like "clang+llvm-$full*" } | Select-Object -First 1
@@ -355,19 +382,33 @@ jobs:
           cd deploy-repo
           mkdir -p Clang/${{ matrix.target }}
           tar -xzf ../clang-${{ matrix.target }}.tar.gz -C Clang/${{ matrix.target }}
-          
+
+          # 确保 LFS 已安装并配置
           git lfs install
-          git lfs track "Clang/**/clang*" "Clang/**/*.exe" "Clang/**/*.a" "Clang/**/*.lib" "Clang/**/*.h"
-          
+
+          # 在添加文件之前，先确保 .gitattributes 中有 LFS 规则
+          # 这样新添加的大文件会直接进入 LFS
+          git lfs track "*.exe" "*.a" "*.lib" "*.dll" "*.so" "*.dylib"
+
+          # 添加所有文件
           git add Clang/ .gitattributes
+
+          # 检查是否有大文件在普通 Git 对象中（历史遗留问题）
+          # 如果有，使用 migrate 将其迁移到 LFS
+          if git lfs migrate info --include="*.exe,*.a,*.lib,*.dll,*.so,*.dylib" 2>/dev/null | grep -q "objects"; then
+            echo "检测到历史中的大文件，正在迁移到 LFS..."
+            git lfs migrate import --include="*.exe,*.a,*.lib,*.dll,*.so,*.dylib" --everything --verbose
+          fi
+
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          
+
           if git diff --staged --quiet; then
             echo "无变化，跳过提交"
           else
             git commit -m "[skip ci] 更新 Clang ${{ env.LLVM_FULL }} - ${{ matrix.target }}（统一Clang + libc++）"
-            git push
+            # 使用 --force 推送，因为 migrate 会重写历史
+            git push --force
           fi
 
       # （可选）上传构建产物
