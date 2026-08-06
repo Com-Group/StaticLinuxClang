@@ -20,19 +20,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Linux x86_64（Alpine 容器，Clang 自举）
+          # Linux 平台（使用 Alpine + musl，Clang 自举）
           - { target: linux-x86_64, runner: ubuntu-22.04, arch: x86_64, triple: x86_64-alpine-linux-musl, target_os: linux }
-          # Linux AArch64（Alpine 容器，Clang 自举）
           - { target: linux-aarch64, runner: ubuntu-22.04-arm, arch: aarch64, triple: aarch64-alpine-linux-musl, target_os: linux }
-          # Linux RISC-V 64（使用 RISE 原生 RISC-V Runner，无需 QEMU）
           - { target: linux-riscv64, runner: ubuntu-24.04-riscv, arch: riscv64, triple: riscv64-alpine-linux-musl, target_os: linux }
 
-          # macOS x86_64（使用 Apple Clang）
+          # macOS 平台（使用 Apple Clang 作为引导编译器）
           - { target: macos-x86_64, runner: macos-13, arch: x86_64, triple: x86_64-apple-darwin, target_os: macos }
-          # macOS ARM64（使用 Apple Clang）
           - { target: macos-arm64, runner: macos-14, arch: arm64, triple: arm64-apple-darwin, target_os: macos }
 
-          # Windows（使用预编译 Clang 引导）
+          # Windows 平台（使用原生 Clang 引导 + libc++）
           - { target: windows-x86_64, runner: windows-2022, arch: x86_64, triple: x86_64-pc-windows-msvc, target_os: windows }
 
     steps:
@@ -54,17 +51,15 @@ jobs:
       - name: 编译静态 Clang 并打包 libc++ (Linux)
         if: matrix.target_os == 'linux'
         run: |
-          # RISC-V 原生 Runner 上无需 QEMU，直接运行 Alpine 容器
           DOCKER_CMD="docker run --rm -v $(pwd):/workspace -w /workspace"
 
-          # 注意：RISC-V 原生 Runner 是 riscv64 架构，可以直接运行 riscv64 容器
-          # 但 Alpine 官方提供 riscv64 镜像，直接使用即可
           $DOCKER_CMD alpine:3.20 sh -c "
             set -e
             apk update
+            # 安装 libunwind-dev 以提供系统 unwinder
             apk add --no-cache alpine-sdk cmake ninja git python3 \
               clang clang-dev lld musl-dev zlib-dev libxml2-dev ncurses-dev \
-              zlib-static libxml2-static ncurses-static
+              zlib-static libxml2-static ncurses-static libunwind-dev
 
             MAJOR=\$(echo '${{ env.LLVM_FULL }}' | cut -d. -f1)
 
@@ -111,6 +106,7 @@ jobs:
               -DLIBCXXABI_ENABLE_STATIC=ON \
               -DLIBCXXABI_ENABLE_SHARED=OFF \
               -DLIBCXXABI_USE_LLVM_UNWINDER=OFF \
+              -DLIBCXXABI_USE_SYSTEM_UNWINDER=ON \
               -DLLVM_INCLUDE_TESTS=OFF \
               -DLLVM_INCLUDE_EXAMPLES=OFF \
               -DLLVM_INCLUDE_BENCHMARKS=OFF \
@@ -121,7 +117,6 @@ jobs:
               -DLLVM_HOST_TRIPLE=${{ matrix.triple }} \
               -DLLVM_RUNTIME_TARGETS=${{ matrix.triple }}
 
-            # 原生 Runner 使用全部 CPU 核心
             ninja -j\$(nproc)
 
             mkdir -p /workspace/static-clang/bin
@@ -361,7 +356,7 @@ jobs:
         run: tar -czf clang-${{ matrix.target }}.tar.gz -C static-clang .
 
       # ====================================================
-      # 5. 部署到 StaticClangPool 仓库
+      # 5. 部署到 StaticClangPool 仓库（修复 LFS）
       # ====================================================
       - name: 拉取 StaticClangPool 仓库（Majority 分支）
         uses: actions/checkout@v4
@@ -381,13 +376,12 @@ jobs:
           git lfs install
           git lfs track "*.exe" "*.a" "*.lib" "*.dll" "*.so" "*.dylib"
 
+          # 添加所有文件（此时可能作为普通文件添加）
           git add Clang/ .gitattributes
 
-          # 如果历史中有大文件，迁移到 LFS
-          if git lfs migrate info --include="*.exe,*.a,*.lib,*.dll,*.so,*.dylib" 2>/dev/null | grep -q "objects"; then
-            echo "检测到历史中的大文件，正在迁移到 LFS..."
-            git lfs migrate import --include="*.exe,*.a,*.lib,*.dll,*.so,*.dylib" --everything --verbose
-          fi
+          # 强制将匹配的大文件迁移到 LFS（会重写历史）
+          echo "正在将大文件迁移到 LFS..."
+          git lfs migrate import --include="*.exe,*.a,*.lib,*.dll,*.so,*.dylib" --force
 
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -396,6 +390,7 @@ jobs:
             echo "无变化，跳过提交"
           else
             git commit -m "[skip ci] 更新 Clang ${{ env.LLVM_FULL }} - ${{ matrix.target }}（统一Clang + libc++）"
+            # 因为 migrate 重写了历史，必须 force push
             git push --force
           fi
 
