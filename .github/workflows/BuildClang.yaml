@@ -74,12 +74,14 @@ jobs:
             if [ -d llvm-project ]; then
               echo '使用缓存的 LLVM 源码'
               cd llvm-project
+              # 更新 remote URL 以使用代理
+              git remote set-url origin https://gh-proxy.org/https://github.com/llvm/llvm-project.git
               git fetch --depth 1 origin release/\${MAJOR}.x
               git checkout release/\${MAJOR}.x
               git submodule update --init --depth 1 clang cmake compiler-rt libcxx libcxxabi lld clang-tools-extra
             else
-              echo '克隆 LLVM 源码'
-              git clone --depth 1 --branch release/\${MAJOR}.x https://github.com/llvm/llvm-project.git
+              echo '克隆 LLVM 源码（通过代理）'
+              git clone --depth 1 --branch release/\${MAJOR}.x https://gh-proxy.org/https://github.com/llvm/llvm-project.git
               cd llvm-project
               git submodule update --init --depth 1 clang cmake compiler-rt libcxx libcxxabi lld clang-tools-extra
             fi
@@ -103,7 +105,7 @@ jobs:
               -DLLVM_ENABLE_PIC=OFF \
               -DBUILD_SHARED_LIBS=OFF \
               -DLLVM_ENABLE_PROJECTS='clang;lld;clang-tools-extra' \
-              -DLLVM_ENABLE_RUNTIMES='libcxx;libcxxabi;compiler-rt' \
+              -DLLVM_ENABLE_RUNTIMES='libcxx;libcxxabi' \
               -DLLVM_ENABLE_LIBCXX=ON \
               -DLLVM_STATIC_LINK_CXX_STDLIB=ON \
               -DLIBCXX_STATICALLY_LINK_ABI_IN_STATIC_LIBRARY=ON \
@@ -157,12 +159,13 @@ jobs:
           if [ -d llvm-project ]; then
             echo '使用缓存的 LLVM 源码'
             cd llvm-project
+            git remote set-url origin https://gh-proxy.org/https://github.com/llvm/llvm-project.git
             git fetch --depth 1 origin release/${MAJOR}.x
             git checkout release/${MAJOR}.x
             git submodule update --init --depth 1 clang cmake compiler-rt libcxx libcxxabi lld clang-tools-extra
           else
-            echo '克隆 LLVM 源码'
-            git clone --depth 1 --branch release/${MAJOR}.x https://github.com/llvm/llvm-project.git
+            echo '克隆 LLVM 源码（通过代理）'
+            git clone --depth 1 --branch release/${MAJOR}.x https://gh-proxy.org/https://github.com/llvm/llvm-project.git
             cd llvm-project
             git submodule update --init --depth 1 clang cmake compiler-rt libcxx libcxxabi lld clang-tools-extra
           fi
@@ -178,7 +181,7 @@ jobs:
             -DCMAKE_CXX_COMPILER=clang++ \
             -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 \
             -DLLVM_ENABLE_PROJECTS='clang;lld;clang-tools-extra' \
-            -DLLVM_ENABLE_RUNTIMES='libcxx;libcxxabi;compiler-rt' \
+            -DLLVM_ENABLE_RUNTIMES='libcxx;libcxxabi' \
             -DLLVM_ENABLE_LIBCXX=ON \
             -DLLVM_STATIC_LINK_CXX_STDLIB=ON \
             -DLIBCXX_STATICALLY_LINK_ABI_IN_STATIC_LIBRARY=ON \
@@ -196,7 +199,8 @@ jobs:
             -DCLANG_TOOL_CLANG_FORMAT_BUILD=ON \
             -DLLVM_DEFAULT_TARGET_TRIPLE=${{ matrix.triple }} \
             -DLLVM_HOST_TRIPLE=${{ matrix.triple }} \
-            -DLLVM_RUNTIME_TARGETS=${{ matrix.triple }}
+            -DLLVM_RUNTIME_TARGETS=${{ matrix.triple }} \
+            -DRUNTIMES_BUILD_ALLOW_DARWIN=ON
 
           ninja clang lld clang-tidy clang-format
 
@@ -222,7 +226,7 @@ jobs:
         shell: pwsh
         run: |
           $full = "${{ env.LLVM_FULL }}"
-          $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$full/clang+llvm-$full-x86_64-pc-windows-msvc.tar.xz"
+          $url = "https://gh-proxy.org/https://github.com/llvm/llvm-project/releases/download/llvmorg-$full/clang+llvm-$full-x86_64-pc-windows-msvc.tar.xz"
           Write-Host "Downloading $url"
           $attempts = 0
           do {
@@ -267,12 +271,13 @@ jobs:
           if [ -d llvm-project ]; then
             echo '使用缓存的 LLVM 源码'
             cd llvm-project
+            git remote set-url origin https://gh-proxy.org/https://github.com/llvm/llvm-project.git
             git fetch --depth 1 origin release/${MAJOR}.x
             git checkout release/${MAJOR}.x
             git submodule update --init --depth 1 clang cmake compiler-rt libcxx libcxxabi lld clang-tools-extra
           else
-            echo '克隆 LLVM 源码'
-            git clone --depth 1 --branch release/${MAJOR}.x https://github.com/llvm/llvm-project.git
+            echo '克隆 LLVM 源码（通过代理）'
+            git clone --depth 1 --branch release/${MAJOR}.x https://gh-proxy.org/https://github.com/llvm/llvm-project.git
             cd llvm-project
             git submodule update --init --depth 1 clang cmake compiler-rt libcxx libcxxabi lld clang-tools-extra
           fi
@@ -292,7 +297,7 @@ jobs:
             -DLLVM_ENABLE_PIC=OFF \
             -DBUILD_SHARED_LIBS=OFF \
             -DLLVM_ENABLE_PROJECTS='clang;lld;clang-tools-extra' \
-            -DLLVM_ENABLE_RUNTIMES='libcxx;libcxxabi;compiler-rt' \
+            -DLLVM_ENABLE_RUNTIMES='libcxx;libcxxabi' \
             -DLLVM_ENABLE_LIBCXX=ON \
             -DLLVM_STATIC_LINK_CXX_STDLIB=ON \
             -DLIBCXX_STATICALLY_LINK_ABI_IN_STATIC_LIBRARY=ON \
