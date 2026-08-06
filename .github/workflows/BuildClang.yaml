@@ -20,20 +20,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Linux 平台（使用 Alpine + musl，Clang 自举）
           - { target: linux-x86_64, runner: ubuntu-22.04, arch: x86_64, triple: x86_64-alpine-linux-musl, target_os: linux }
           - { target: linux-aarch64, runner: ubuntu-22.04-arm, arch: aarch64, triple: aarch64-alpine-linux-musl, target_os: linux }
           - { target: linux-riscv64, runner: ubuntu-24.04-riscv, arch: riscv64, triple: riscv64-alpine-linux-musl, target_os: linux }
-
-          # macOS 平台（使用 Apple Clang 作为引导编译器）
           - { target: macos-x86_64, runner: macos-13, arch: x86_64, triple: x86_64-apple-darwin, target_os: macos }
           - { target: macos-arm64, runner: macos-14, arch: arm64, triple: arm64-apple-darwin, target_os: macos }
-
-          # Windows 平台（使用原生 Clang 引导 + libc++）
           - { target: windows-x86_64, runner: windows-2022, arch: x86_64, triple: x86_64-pc-windows-msvc, target_os: windows }
 
     steps:
-      # ---------- 全局缓存 ----------
       - name: 缓存 LLVM 源码与构建
         uses: actions/cache@v5
         id: cache-llvm
@@ -45,34 +39,27 @@ jobs:
           restore-keys: |
             llvm-${{ env.LLVM_FULL }}-${{ matrix.target }}-${{ matrix.arch }}-clang-libcxx-
 
-      # ====================================================
-      # 1. Linux 编译（Alpine + Clang 自举 + 静态 libc++）
-      # ====================================================
+      # ==================== Linux ====================
       - name: 编译静态 Clang 并打包 libc++ (Linux)
         if: matrix.target_os == 'linux'
         run: |
           DOCKER_CMD="docker run --rm -v $(pwd):/workspace -w /workspace"
-
           $DOCKER_CMD alpine:3.20 sh -c "
             set -e
             apk update
-            # 安装 libunwind-dev 以提供系统 unwinder
             apk add --no-cache alpine-sdk cmake ninja git python3 \
               clang clang-dev lld musl-dev zlib-dev libxml2-dev ncurses-dev \
               zlib-static libxml2-static ncurses-static libunwind-dev
 
             MAJOR=\$(echo '${{ env.LLVM_FULL }}' | cut -d. -f1)
-
             cd /workspace
             if [ -d llvm-project ]; then
-              echo '使用缓存的 LLVM 源码'
               cd llvm-project
               git remote set-url origin https://gh-proxy.org/https://github.com/llvm/llvm-project.git
               git fetch --depth 1 origin release/\${MAJOR}.x
               git checkout release/\${MAJOR}.x
               git submodule update --init --depth 1 clang cmake compiler-rt libcxx libcxxabi lld clang-tools-extra
             else
-              echo '克隆 LLVM 源码（通过代理）'
               git clone --depth 1 --branch release/\${MAJOR}.x https://gh-proxy.org/https://github.com/llvm/llvm-project.git
               cd llvm-project
               git submodule update --init --depth 1 clang cmake compiler-rt libcxx libcxxabi lld clang-tools-extra
@@ -81,7 +68,6 @@ jobs:
             rm -rf /workspace/llvm-build-cache
             mkdir -p /workspace/llvm-build-cache
             cd /workspace/llvm-build-cache
-
             export CC=clang
             export CXX=clang++
 
@@ -119,52 +105,35 @@ jobs:
 
             ninja -j\$(nproc)
 
-            mkdir -p /workspace/static-clang/bin
-            mkdir -p /workspace/static-clang/include
-            mkdir -p /workspace/static-clang/lib
-
-            cp bin/clang /workspace/static-clang/bin/
-            cp bin/clang++ /workspace/static-clang/bin/
-            cp bin/lld /workspace/static-clang/bin/
-            cp bin/clang-tidy /workspace/static-clang/bin/
-            cp bin/clang-format /workspace/static-clang/bin/
-
+            mkdir -p /workspace/static-clang/bin /workspace/static-clang/include /workspace/static-clang/lib
+            cp bin/clang bin/clang++ bin/lld bin/clang-tidy bin/clang-format /workspace/static-clang/bin/
             cp -r /workspace/llvm-project/libcxx/include /workspace/static-clang/include/libcxx
             cp -r /workspace/llvm-project/libcxxabi/include /workspace/static-clang/include/libcxxabi
-
             find . -name 'libc++.a' -exec cp {} /workspace/static-clang/lib/ \;
             find . -name 'libc++abi.a' -exec cp {} /workspace/static-clang/lib/ \;
           "
 
-      # ====================================================
-      # 2. macOS 编译（Apple Clang 引导 + 静态 libc++）
-      # ====================================================
+      # ==================== macOS ====================
       - name: 编译静态 Clang 并打包 libc++ (macOS)
         if: matrix.target_os == 'macos'
         run: |
           cd ${{ github.workspace }}
-
           MAJOR=$(echo '${{ env.LLVM_FULL }}' | cut -d. -f1)
-
           if [ -d llvm-project ]; then
-            echo '使用缓存的 LLVM 源码'
             cd llvm-project
             git remote set-url origin https://gh-proxy.org/https://github.com/llvm/llvm-project.git
             git fetch --depth 1 origin release/${MAJOR}.x
             git checkout release/${MAJOR}.x
             git submodule update --init --depth 1 clang cmake compiler-rt libcxx libcxxabi lld clang-tools-extra
           else
-            echo '克隆 LLVM 源码（通过代理）'
             git clone --depth 1 --branch release/${MAJOR}.x https://gh-proxy.org/https://github.com/llvm/llvm-project.git
             cd llvm-project
             git submodule update --init --depth 1 clang cmake compiler-rt libcxx libcxxabi lld clang-tools-extra
           fi
-
           cd ${{ github.workspace }}
           rm -rf llvm-build-cache
           mkdir -p llvm-build-cache
           cd llvm-build-cache
-
           cmake -G Ninja ../llvm-project/llvm \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_COMPILER=clang \
@@ -191,26 +160,15 @@ jobs:
             -DLLVM_HOST_TRIPLE=${{ matrix.triple }} \
             -DLLVM_RUNTIME_TARGETS=${{ matrix.triple }} \
             -DRUNTIMES_BUILD_ALLOW_DARWIN=ON
-
           ninja clang lld clang-tidy clang-format
-
           mkdir -p ../static-clang/bin ../static-clang/include ../static-clang/lib
-
-          cp bin/clang ../static-clang/bin/
-          cp bin/clang++ ../static-clang/bin/
-          cp bin/lld ../static-clang/bin/
-          cp bin/clang-tidy ../static-clang/bin/
-          cp bin/clang-format ../static-clang/bin/
-
+          cp bin/clang bin/clang++ bin/lld bin/clang-tidy bin/clang-format ../static-clang/bin/
           cp -r ../llvm-project/libcxx/include ../static-clang/include/libcxx
           cp -r ../llvm-project/libcxxabi/include ../static-clang/include/libcxxabi
-
           find . -name 'libc++.a' -exec cp {} ../static-clang/lib/ \;
           find . -name 'libc++abi.a' -exec cp {} ../static-clang/lib/ \;
 
-      # ====================================================
-      # 3. Windows 编译（原生 Clang 引导 + 静态 libc++）
-      # ====================================================
+      # ==================== Windows ====================
       - name: 下载 LLVM 预编译包 (Windows)
         if: matrix.target_os == 'windows'
         shell: pwsh
@@ -256,9 +214,27 @@ jobs:
           if (-not (Test-Path llvm.tar.xz) -or (Get-Item llvm.tar.xz).Length -eq 0) {
             throw "下载的文件无效或为空"
           }
-          Write-Host "下载完成，文件大小: $(Get-Item llvm.tar.xz).Length 字节"
+          Write-Host "下载完成，文件大小: $((Get-Item llvm.tar.xz).Length) 字节"
 
-          tar -xvf llvm.tar.xz
+          # 使用 7z 解压
+          $7zPath = (Get-Command 7z -ErrorAction SilentlyContinue).Source
+          if (-not $7zPath) {
+            Write-Host "7z 未安装，正在通过 Chocolatey 安装..."
+            choco install 7zip -y --limit-output
+            $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+            $7zPath = (Get-Command 7z -ErrorAction SilentlyContinue).Source
+            if (-not $7zPath) {
+              throw "7z 安装失败，无法解压"
+            }
+          }
+          Write-Host "使用 7z 解压 (路径: $7zPath)"
+          Write-Host "解压中..."
+          & $7zPath x llvm.tar.xz -so | & $7zPath x -si -ttar -o. -y
+          if ($LASTEXITCODE -ne 0) {
+            throw "解压失败，退出码: $LASTEXITCODE"
+          }
+          Write-Host "解压完成"
+
           $dir = Get-ChildItem -Directory | Where-Object { $_.Name -like "clang+llvm-$full*" } | Select-Object -First 1
           if (-not $dir) {
             $dir = Get-ChildItem -Directory -Filter "clang+llvm-*" | Select-Object -First 1
@@ -266,6 +242,7 @@ jobs:
           if (-not $dir) {
             throw "未找到解压后的目录"
           }
+          Write-Host "找到目录: $($dir.FullName)"
           Rename-Item -Path $dir.FullName -NewName "llvm-install"
           $binPath = "$(Get-Location)\llvm-install\bin"
           Add-Content $env:GITHUB_PATH $binPath
@@ -282,28 +259,22 @@ jobs:
         run: |
           WORKSPACE="$(cygpath -u "${{ github.workspace }}")"
           cd "$WORKSPACE"
-
           MAJOR=$(echo '${{ env.LLVM_FULL }}' | cut -d. -f1)
-
           if [ -d llvm-project ]; then
-            echo '使用缓存的 LLVM 源码'
             cd llvm-project
             git remote set-url origin https://gh-proxy.org/https://github.com/llvm/llvm-project.git
             git fetch --depth 1 origin release/${MAJOR}.x
             git checkout release/${MAJOR}.x
             git submodule update --init --depth 1 clang cmake compiler-rt libcxx libcxxabi lld clang-tools-extra
           else
-            echo '克隆 LLVM 源码（通过代理）'
             git clone --depth 1 --branch release/${MAJOR}.x https://gh-proxy.org/https://github.com/llvm/llvm-project.git
             cd llvm-project
             git submodule update --init --depth 1 clang cmake compiler-rt libcxx libcxxabi lld clang-tools-extra
           fi
-
           cd "$WORKSPACE"
           rm -rf llvm-build-cache
           mkdir -p llvm-build-cache
           cd llvm-build-cache
-
           cmake -G Ninja ../llvm-project/llvm \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_COMPILER=clang \
@@ -331,33 +302,20 @@ jobs:
             -DLLVM_DEFAULT_TARGET_TRIPLE=${{ matrix.triple }} \
             -DLLVM_HOST_TRIPLE=${{ matrix.triple }} \
             -DLLVM_RUNTIME_TARGETS=${{ matrix.triple }}
-
           NPROC=$(nproc 2>/dev/null || echo 4)
           ninja -j$NPROC
-
           mkdir -p ../static-clang/bin ../static-clang/include ../static-clang/lib
-
-          cp bin/clang.exe ../static-clang/bin/
-          cp bin/clang++.exe ../static-clang/bin/
-          cp bin/lld.exe ../static-clang/bin/
-          cp bin/clang-tidy.exe ../static-clang/bin/
-          cp bin/clang-format.exe ../static-clang/bin/
-
+          cp bin/clang.exe bin/clang++.exe bin/lld.exe bin/clang-tidy.exe bin/clang-format.exe ../static-clang/bin/
           cp -r ../llvm-project/libcxx/include ../static-clang/include/libcxx
           cp -r ../llvm-project/libcxxabi/include ../static-clang/include/libcxxabi
-
           find . -name 'libc++.lib' -exec cp {} ../static-clang/lib/ \;
           find . -name 'libc++abi.lib' -exec cp {} ../static-clang/lib/ \;
 
-      # ====================================================
-      # 4. 打包二进制文件（包含 bin、include、lib）
-      # ====================================================
+      # ==================== 打包 ====================
       - name: 打包完整目录
         run: tar -czf clang-${{ matrix.target }}.tar.gz -C static-clang .
 
-      # ====================================================
-      # 5. 部署到 StaticClangPool 仓库（修复 LFS）
-      # ====================================================
+      # ==================== 部署 ====================
       - name: 拉取 StaticClangPool 仓库（Majority 分支）
         uses: actions/checkout@v4
         with:
@@ -376,10 +334,9 @@ jobs:
           git lfs install
           git lfs track "*.exe" "*.a" "*.lib" "*.dll" "*.so" "*.dylib"
 
-          # 添加所有文件（此时可能作为普通文件添加）
           git add Clang/ .gitattributes
 
-          # 强制将匹配的大文件迁移到 LFS（会重写历史）
+          # 强制迁移大文件到 LFS（解决历史问题）
           echo "正在将大文件迁移到 LFS..."
           git lfs migrate import --include="*.exe,*.a,*.lib,*.dll,*.so,*.dylib" --force
 
@@ -390,11 +347,9 @@ jobs:
             echo "无变化，跳过提交"
           else
             git commit -m "[skip ci] 更新 Clang ${{ env.LLVM_FULL }} - ${{ matrix.target }}（统一Clang + libc++）"
-            # 因为 migrate 重写了历史，必须 force push
             git push --force
           fi
 
-      # （可选）上传构建产物
       - name: 上传构建产物（可选）
         uses: actions/upload-artifact@v4
         with:
