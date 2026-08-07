@@ -1,4 +1,4 @@
-name: Build with Clang & libc++
+name: Build Static Clang (musl)
 
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ on:
         required: true
         default: '18.1.8'
       macos_deployment_target:
-        description: 'macOS 最低部署目标（仅 macOS 平台使用，例如 10.15 或 11.0）'
+        description: 'macOS 最低部署目标（仅 macOS 平台使用）'
         required: false
         default: '10.15'
 
@@ -27,203 +27,165 @@ jobs:
           - { target: windows-x86_64, runner: windows-2022, arch: x86_64, triple: x86_64-pc-windows-msvc, target_os: windows }
 
     steps:
-      - name: Checkout 当前仓库
+      - name: Checkout
         uses: actions/checkout@v4
 
-      # --------------------------------------------
-      # 1. 安装 Node.js（仅当存在 package.json）
-      # --------------------------------------------
+      # --- 通用 Node.js（可选） ---
       - name: 安装 Node.js (LTS)
         if: hashFiles('package.json') != ''
         uses: actions/setup-node@v4
         with:
           node-version: 'lts/*'
 
-      # --------------------------------------------
-      # 2. 安装/更新系统级 LLVM 工具链（引导编译）
-      # --------------------------------------------
-      - name: 安装/更新 LLVM 工具链（Linux）
+      # --- Linux 专用：构建 musl 工具链 ---
+      - name: Linux - 构建 musl 和 libc++ 静态库
         if: matrix.target_os == 'linux'
         run: |
-          sudo apt-get update -q
-          sudo apt-get install -y clang libc++-dev libc++abi-dev ninja-build
-          clang --version
-        shell: bash
+          set -e
+          SYSROOT="$PWD/musl-sysroot"
+          mkdir -p "$SYSROOT"
 
-      - name: 安装/更新 LLVM 工具链（macOS）
-        if: matrix.target_os == 'macos'
-        run: |
-          brew update
-          brew install llvm ninja || brew upgrade llvm ninja
-          if [[ "${{ matrix.arch }}" == "arm64" ]]; then
-            echo "/opt/homebrew/opt/llvm/bin" >> $GITHUB_PATH
-          else
-            echo "/usr/local/opt/llvm/bin" >> $GITHUB_PATH
-          fi
-          clang --version
-        shell: bash
-
-      - name: 安装/更新 LLVM-MinGW 工具链（Windows）
-        if: matrix.target_os == 'windows'
-        run: |
-          choco list llvm-mingw --local-only --limit-output || choco install llvm-mingw -y
-          choco upgrade llvm-mingw -y
-          choco install ninja -y
-          $mingw_path = (Get-ChildItem -Path "C:\ProgramData\chocolatey\lib\llvm-mingw" -Directory | Select-Object -First 1).FullName
-          if ($mingw_path) {
-            $bin_path = Join-Path $mingw_path "bin"
-            if (Test-Path $bin_path) {
-              echo "$bin_path" >> $env:GITHUB_PATH
-            }
-          }
-          clang --version
-        shell: pwsh
-
-      # --------------------------------------------
-      # 3. 下载 LLVM 源代码
-      # --------------------------------------------
-      - name: 克隆 LLVM 项目
-        run: |
-          VERSION="${{ github.event.inputs.llvm_version }}"
-          LLVM_TAG="llvmorg-${VERSION}"
-          echo "克隆标签: $LLVM_TAG"
-          git clone --depth 1 --branch "$LLVM_TAG" https://github.com/llvm/llvm-project.git llvm-project
-          cd llvm-project
-          git describe --tags --always
-        shell: bash
-
-      # --------------------------------------------
-      # 4. （仅 Linux）编译 musl libc 并安装为 sysroot
-      # --------------------------------------------
-      - name: 构建 musl libc（Linux）
-        if: matrix.target_os == 'linux'
-        run: |
-          echo "--- 下载 musl 源码 ---"
-          git clone https://git.musl-libc.org/git/musl musl-src
+          # 1. 下载 musl 源码并编译
+          git clone --depth 1 https://git.musl-libc.org/git/musl musl-src
           cd musl-src
-          echo "--- 配置 musl（安装到 $PWD/../musl-sysroot/usr） ---"
-          ./configure --prefix=/usr --disable-shared  # 仅静态库，便于封装
+          ./configure --prefix=/usr --disable-shared --syslibdir=/usr/lib
           make -j$(nproc)
-          # 安装到 musl-sysroot 目录，结构为 usr/include, usr/lib 等
-          make install DESTDIR="$PWD/../musl-sysroot"
+          make DESTDIR="$SYSROOT" install
           cd ..
-          echo "musl 安装完成，sysroot 位于: $PWD/musl-sysroot"
+
+          # 2. 下载 LLVM 源码（用于 libc++）
+          git clone --depth 1 --branch "llvmorg-${{ github.event.inputs.llvm_version }}" https://github.com/llvm/llvm-project.git llvm-project
+
+          # 3. 使用宿主 clang 编译 libc++ 和 libc++abi（针对 musl 目标，静态）
+          mkdir build-libcxx && cd build-libcxx
+          # 设置编译器为宿主 clang，目标为 musl 三元组，并指定 sysroot
+          export CC=/usr/bin/clang
+          export CXX=/usr/bin/clang++
+          export CFLAGS="--target=${{ matrix.triple }} --sysroot=$SYSROOT"
+          export CXXFLAGS="--target=${{ matrix.triple }} --sysroot=$SYSROOT"
+          export LDFLAGS="--target=${{ matrix.triple }} --sysroot=$SYSROOT"
+          cmake -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$SYSROOT/usr" \
+            -DLLVM_ENABLE_PROJECTS="libcxx;libcxxabi" \
+            -DLLVM_TARGETS_TO_BUILD="host" \
+            -DLIBCXX_ENABLE_STATIC=ON \
+            -DLIBCXX_ENABLE_SHARED=OFF \
+            -DLIBCXXABI_ENABLE_STATIC=ON \
+            -DLIBCXXABI_ENABLE_SHARED=OFF \
+            -DLIBCXX_USE_COMPILER_RT=OFF \
+            -DLIBCXXABI_USE_COMPILER_RT=OFF \
+            -DCMAKE_CXX_STANDARD=17 \
+            ../llvm-project/llvm
+          ninja -j$(nproc) install
+          cd ..
+
+          echo "musl 和 libc++ 静态库已安装到 $SYSROOT"
         shell: bash
 
-      # --------------------------------------------
-      # 5. 构建 LLVM（使用 musl 作为默认 libc）
-      # --------------------------------------------
-      - name: 构建 LLVM（默认使用 musl）
+      # --- Linux 专用：静态编译 Clang ---
+      - name: Linux - 静态编译 Clang (链接 musl)
+        if: matrix.target_os == 'linux'
         run: |
+          set -e
+          SYSROOT="$PWD/musl-sysroot"
           INSTALL_DIR="$PWD/install"
-          echo "安装目录: $INSTALL_DIR"
           rm -rf "$INSTALL_DIR"
           mkdir -p "$INSTALL_DIR"
 
-          # 设置 sysroot（仅 Linux）
-          if [[ "${{ matrix.target_os }}" == "linux" ]]; then
-            SYSROOT="$PWD/musl-sysroot"
-            echo "使用 musl sysroot: $SYSROOT"
-          else
-            SYSROOT=""
-          fi
-
           mkdir build && cd build
-
-          CMAKE_ARGS=(
-            -G Ninja
-            -DCMAKE_BUILD_TYPE=Release
-            -DLLVM_ENABLE_PROJECTS="clang;clang-tools-extra"
-            -DLLVM_ENABLE_RUNTIMES="libcxx;libcxxabi"
-            -DLLVM_TARGETS_TO_BUILD="host"
-            -DCMAKE_INSTALL_PREFIX="$INSTALL_DIR"
-            -DLLVM_INCLUDE_BENCHMARKS=OFF
-            -DLLVM_INCLUDE_TESTS=OFF
-            -DLLVM_INCLUDE_EXAMPLES=OFF
-            -DLLVM_INCLUDE_DOCS=OFF
-            -DCLANG_DEFAULT_CXX_STDLIB=libc++
-            -DLIBCXX_ENABLE_STATIC_ABI_LIBRARY=ON
-            -DLIBCXX_USE_COMPILER_RT=OFF
-            -DLIBCXXABI_USE_COMPILER_RT=OFF
-            -DCMAKE_CXX_STANDARD=17
-            -DCMAKE_C_STANDARD=11
-          )
-
-          if [[ "${{ matrix.target_os }}" == "linux" ]]; then
-            # 使用系统 clang 编译，但指定目标为 musl 三元组
-            CMAKE_ARGS+=(
-              -DCMAKE_C_COMPILER=clang
-              -DCMAKE_CXX_COMPILER=clang++
-              -DLLVM_DEFAULT_TARGET_TRIPLE="${{ matrix.triple }}"
-              -DCMAKE_SYSROOT="$SYSROOT"
-              # 强制使用 musl 的库和头文件
-              -DC_INCLUDE_DIRS="$SYSROOT/usr/include"
-              -DCXX_INCLUDE_DIRS="$SYSROOT/usr/include/c++/v1"  # libc++ 头文件仍来自 LLVM，但这里我们用 musl 的 C 头文件
-            )
-            # 注意：libc++ 的编译会依赖 glibc 头文件？我们需要确保 libc++ 编译时使用 musl 的 sysroot
-            # 可以额外传递 -DCMAKE_CXX_FLAGS="--sysroot=$SYSROOT" 等
-            export CFLAGS="--sysroot=$SYSROOT"
-            export CXXFLAGS="--sysroot=$SYSROOT"
-          elif [[ "${{ matrix.target_os }}" == "macos" ]]; then
-            DEPLOY_TARGET="${{ github.event.inputs.macos_deployment_target }}"
-            export MACOSX_DEPLOYMENT_TARGET="$DEPLOY_TARGET"
-            CMAKE_ARGS+=(
-              -DCMAKE_C_COMPILER=clang
-              -DCMAKE_CXX_COMPILER=clang++
-              -DCMAKE_OSX_DEPLOYMENT_TARGET="$DEPLOY_TARGET"
-            )
-          elif [[ "${{ matrix.target_os }}" == "windows" ]]; then
-            CMAKE_ARGS+=(
-              -DCMAKE_C_COMPILER=clang
-              -DCMAKE_CXX_COMPILER=clang++
-              -DCMAKE_SYSTEM_NAME=Windows
-              -DCMAKE_SYSTEM_PROCESSOR=${{ matrix.arch }}
-              -DLLVM_DEFAULT_TARGET_TRIPLE=${{ matrix.triple }}
-            )
-          fi
-
-          cmake "${CMAKE_ARGS[@]}" ../llvm-project/llvm
-          ninja -j$(nproc 2>/dev/null || echo 2) install
+          export CC=/usr/bin/clang
+          export CXX=/usr/bin/clang++
+          # 使用 musl 目标，并指定 sysroot
+          export CFLAGS="--target=${{ matrix.triple }} --sysroot=$SYSROOT -static"
+          export CXXFLAGS="--target=${{ matrix.triple }} --sysroot=$SYSROOT -static -stdlib=libc++"
+          export LDFLAGS="--target=${{ matrix.triple }} --sysroot=$SYSROOT -static -Wl,--no-as-needed"
+          # 禁用所有外部依赖，避免额外动态链接
+          cmake -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$INSTALL_DIR" \
+            -DLLVM_ENABLE_PROJECTS="clang;clang-tools-extra" \
+            -DLLVM_ENABLE_RUNTIMES="libcxx;libcxxabi" \
+            -DLLVM_TARGETS_TO_BUILD="host" \
+            -DLLVM_INCLUDE_BENCHMARKS=OFF \
+            -DLLVM_INCLUDE_TESTS=OFF \
+            -DLLVM_INCLUDE_EXAMPLES=OFF \
+            -DLLVM_INCLUDE_DOCS=OFF \
+            -DCLANG_DEFAULT_CXX_STDLIB=libc++ \
+            -DLLVM_ENABLE_ZLIB=OFF \
+            -DLLVM_ENABLE_LIBXML2=OFF \
+            -DLLVM_ENABLE_TERMINFO=OFF \
+            -DLLVM_ENABLE_LIBEDIT=OFF \
+            -DLLVM_ENABLE_FFI=OFF \
+            -DLLVM_ENABLE_PIC=OFF \
+            -DLLVM_BUILD_STATIC=ON \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DCMAKE_EXE_LINKER_FLAGS="-static -Wl,--no-as-needed" \
+            -DCMAKE_CXX_STANDARD=17 \
+            -DCMAKE_C_STANDARD=11 \
+            ../llvm-project/llvm
+          ninja -j$(nproc) install
+          cd ..
+          # 复制 sysroot 到 install（供用户后续使用）
+          cp -r "$SYSROOT" "$INSTALL_DIR/sysroot"
         shell: bash
 
-      # --------------------------------------------
-      # 6. 验证安装（查看新 clang 的默认 target）
-      # --------------------------------------------
-      - name: 验证 Clang 默认 target 和 sysroot
+      # --- macOS 专用：使用系统 clang 构建 ---
+      - name: macOS - 安装工具并构建
+        if: matrix.target_os == 'macos'
+        run: |
+          brew install ninja
+          INSTALL_DIR="$PWD/install"
+          rm -rf "$INSTALL_DIR"
+          mkdir -p "$INSTALL_DIR"
+          mkdir build && cd build
+          /usr/bin/clang --version
+          cmake -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$INSTALL_DIR" \
+            -DLLVM_ENABLE_PROJECTS="clang;clang-tools-extra" \
+            -DLLVM_ENABLE_RUNTIMES="libcxx;libcxxabi" \
+            -DLLVM_TARGETS_TO_BUILD="host" \
+            -DLLVM_INCLUDE_BENCHMARKS=OFF \
+            -DLLVM_INCLUDE_TESTS=OFF \
+            -DLLVM_INCLUDE_EXAMPLES=OFF \
+            -DLLVM_INCLUDE_DOCS=OFF \
+            -DCLANG_DEFAULT_CXX_STDLIB=libc++ \
+            -DCMAKE_C_COMPILER=/usr/bin/clang \
+            -DCMAKE_CXX_COMPILER=/usr/bin/clang++ \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET="${{ github.event.inputs.macos_deployment_target }}" \
+            ../llvm-project/llvm
+          ninja -j$(sysctl -n hw.ncpu) install
+        shell: bash
+
+      # --- Windows 专用：下载 LLVM-MinGW 构建 ---
+      - name: Windows - 下载 LLVM-MinGW 并构建
+        if: matrix.target_os == 'windows'
+        run: |
+          $LLVM_MINGW_VERSION = "20241119"
+          $DOWNLOAD_URL = "https://github.com/mstorsjo/llvm-mingw/releases/download/$LLVM_MINGW_VERSION/llvm-mingw-$LLVM_MINGW_VERSION-msvcrt-x86_64.zip"
+          Invoke-WebRequest -Uri $DOWNLOAD_URL -OutFile llvm-mingw.zip
+          Expand-Archive -Path llvm-mingw.zip -DestinationPath .
+          $MINGW_PATH = Join-Path $PWD "llvm-mingw-$LLVM_MINGW_VERSION-msvcrt-x86_64"
+          $BIN_PATH = Join-Path $MINGW_PATH "bin"
+          echo "$BIN_PATH" >> $env:GITHUB_PATH
+          # 使用 mingw 的 clang 编译
+          mkdir build; cd build
+          cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$env:INSTALL_DIR" -DLLVM_ENABLE_PROJECTS="clang;clang-tools-extra" -DLLVM_ENABLE_RUNTIMES="libcxx;libcxxabi" -DLLVM_TARGETS_TO_BUILD="host" -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_SYSTEM_NAME=Windows -DCMAKE_SYSTEM_PROCESSOR=${{ matrix.arch }} -DLLVM_DEFAULT_TARGET_TRIPLE=${{ matrix.triple }} -DLLVM_INCLUDE_BENCHMARKS=OFF -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_EXAMPLES=OFF -DLLVM_INCLUDE_DOCS=OFF -DCLANG_DEFAULT_CXX_STDLIB=libc++ ../llvm-project/llvm
+          ninja install
+        shell: pwsh
+
+      # --- 通用：验证并打包 ---
+      - name: 验证 Clang 并打包
         run: |
           INSTALL_DIR="$PWD/install"
+          echo "--- 验证 clang ---"
           "$INSTALL_DIR/bin/clang" --version
-          echo "--- 默认目标三元组 ---"
-          "$INSTALL_DIR/bin/clang" -dumpmachine || echo "无法获取"
-          echo "--- 搜索路径 ---"
-          "$INSTALL_DIR/bin/clang" -print-search-dirs || echo "无法获取"
-        shell: bash
-
-      # --------------------------------------------
-      # 7. （可选）npm 安装及构建
-      # --------------------------------------------
-      - name: 安装项目依赖（npm）
-        if: hashFiles('package.json') != ''
-        run: npm ci
-        shell: bash
-
-      - name: 执行构建（npm）
-        if: hashFiles('package.json') != ''
-        run: |
-          INSTALL_DIR="$PWD/install"
-          export PATH="$INSTALL_DIR/bin:$PATH"
-          echo "当前目标: ${{ matrix.target }}"
-          echo "架构: ${{ matrix.arch }}"
-          echo "三元组: ${{ matrix.triple }}"
-          clang --version
-          npm run build
-        shell: bash
-
-      # --------------------------------------------
-      # 8. 打包并上传 Release
-      # --------------------------------------------
-      - name: 打包工具链
-        run: |
+          if [[ "${{ matrix.target_os }}" == "linux" ]]; then
+            echo "--- 检查 clang 是否为静态链接（应输出 'not a dynamic executable'） ---"
+            file "$INSTALL_DIR/bin/clang" || true
+          fi
+          # 打包
           case "${{ matrix.arch }}" in
             x86_64) ARCH_NAME="x86" ;;
             aarch64|arm64) ARCH_NAME="ARM" ;;
@@ -236,14 +198,12 @@ jobs:
             windows) OS_NAME="Windows" ;;
             *) OS_NAME="${{ matrix.target_os }}" ;;
           esac
-          BIT="64-bit"
-          PACKAGE_NAME="StaticClangChain--${BIT}--${ARCH_NAME}--${OS_NAME}.tar.gz"
-          echo "压缩包名称: $PACKAGE_NAME"
+          PACKAGE_NAME="StaticClangChain--64-bit--${ARCH_NAME}--${OS_NAME}.tar.gz"
           echo "PACKAGE_NAME=$PACKAGE_NAME" >> $GITHUB_ENV
           tar czf "$PACKAGE_NAME" -C "$PWD" install/
         shell: bash
 
-      - name: 上传至 Release
+      - name: 上传 Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: "StaticClang-${{ github.event.inputs.llvm_version }}"
@@ -251,6 +211,5 @@ jobs:
           files: ${{ env.PACKAGE_NAME }}
           draft: false
           prerelease: false
-          generate_release_notes: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
