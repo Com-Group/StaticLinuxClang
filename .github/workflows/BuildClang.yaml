@@ -1,359 +1,259 @@
-name: 编译Clang多平台（统一Clang + 打包libc++）
+name: Build with Clang & libc++
 
 on:
   workflow_dispatch:
     inputs:
       llvm_version:
-        description: 'LLVM 完整版本号（例如 20.1.8）'
+        description: 'LLVM 版本号（例如 18.1.8）'
         required: true
-        default: '20.1.8'
-
-env:
-  LLVM_FULL: ${{ github.event.inputs.llvm_version }}
+        default: '18.1.8'
+      macos_deployment_target:
+        description: 'macOS 最低部署目标（仅 macOS 平台使用，例如 10.15 或 11.0）'
+        required: false
+        default: '10.15'
 
 jobs:
-  build:
-    name: ${{ matrix.target }}
+  multi-platform-build:
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 420
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { target: linux-x86_64, runner: ubuntu-22.04, arch: x86_64, triple: x86_64-alpine-linux-musl, target_os: linux }
-          - { target: linux-aarch64, runner: ubuntu-22.04-arm, arch: aarch64, triple: aarch64-alpine-linux-musl, target_os: linux }
+          - { target: linux-x86_64, runner: ubuntu-24.04, arch: x86_64, triple: x86_64-alpine-linux-musl, target_os: linux }
+          - { target: linux-aarch64, runner: ubuntu-24.04-arm, arch: aarch64, triple: aarch64-alpine-linux-musl, target_os: linux }
           - { target: linux-riscv64, runner: ubuntu-24.04-riscv, arch: riscv64, triple: riscv64-alpine-linux-musl, target_os: linux }
           - { target: macos-x86_64, runner: macos-13, arch: x86_64, triple: x86_64-apple-darwin, target_os: macos }
           - { target: macos-arm64, runner: macos-14, arch: arm64, triple: arm64-apple-darwin, target_os: macos }
           - { target: windows-x86_64, runner: windows-2022, arch: x86_64, triple: x86_64-pc-windows-msvc, target_os: windows }
 
     steps:
-      - name: 缓存 LLVM 源码与构建
-        uses: actions/cache@v5
-        id: cache-llvm
-        with:
-          path: |
-            llvm-project
-            llvm-build-cache
-          key: llvm-${{ env.LLVM_FULL }}-${{ matrix.target }}-${{ matrix.arch }}-clang-libcxx
-          restore-keys: |
-            llvm-${{ env.LLVM_FULL }}-${{ matrix.target }}-${{ matrix.arch }}-clang-libcxx-
+      - name: Checkout 当前仓库
+        uses: actions/checkout@v4
 
-      # ==================== Linux ====================
-      - name: 编译静态 Clang 并打包 libc++ (Linux)
+      # --------------------------------------------
+      # 1. Node.js 设置及缓存（npm）
+      # --------------------------------------------
+      - name: 安装 Node.js (LTS) 并缓存 npm（非 RISC-V）
+        if: matrix.arch != 'riscv64'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 'lts/*'
+          cache: 'npm'
+          cache-dependency-path: package-lock.json
+
+      - name: 缓存 npm（RISC-V 手动）
+        if: matrix.arch == 'riscv64'
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-npm-${{ hashFiles('package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-npm-
+
+      # --------------------------------------------
+      # 2. 安装/更新系统级 LLVM 工具链（引导编译）
+      # --------------------------------------------
+      - name: 安装/更新 LLVM 工具链（Linux）
         if: matrix.target_os == 'linux'
         run: |
-          DOCKER_CMD="docker run --rm -v $(pwd):/workspace -w /workspace"
-          $DOCKER_CMD alpine:3.20 sh -c "
-            set -e
-            apk update
-            apk add --no-cache alpine-sdk cmake ninja git python3 \
-              clang clang-dev lld musl-dev zlib-dev libxml2-dev ncurses-dev \
-              zlib-static libxml2-static ncurses-static libunwind-dev
+          sudo apt-get update -q
+          sudo apt-get install -y clang libc++-dev libc++abi-dev ninja-build
+          clang --version
+        shell: bash
 
-            MAJOR=\$(echo '${{ env.LLVM_FULL }}' | cut -d. -f1)
-            cd /workspace
-            if [ -d llvm-project ]; then
-              cd llvm-project
-              git remote set-url origin https://gh-proxy.org/https://github.com/llvm/llvm-project.git
-              git fetch --depth 1 origin release/\${MAJOR}.x
-              git checkout release/\${MAJOR}.x
-              git submodule update --init --depth 1 clang cmake compiler-rt libcxx libcxxabi lld clang-tools-extra
-            else
-              git clone --depth 1 --branch release/\${MAJOR}.x https://gh-proxy.org/https://github.com/llvm/llvm-project.git
-              cd llvm-project
-              git submodule update --init --depth 1 clang cmake compiler-rt libcxx libcxxabi lld clang-tools-extra
-            fi
-
-            rm -rf /workspace/llvm-build-cache
-            mkdir -p /workspace/llvm-build-cache
-            cd /workspace/llvm-build-cache
-            export CC=clang
-            export CXX=clang++
-
-            # 注意：将 -DLIBCXXABI_USE_* 放在 -C 之后，确保覆盖缓存
-            cmake -G Ninja /workspace/llvm-project/llvm \
-              -DCMAKE_BUILD_TYPE=Release \
-              -DCMAKE_C_COMPILER=clang \
-              -DCMAKE_CXX_COMPILER=clang++ \
-              -DCMAKE_SYSTEM_NAME=Linux \
-              -DCMAKE_SYSTEM_PROCESSOR=${{ matrix.arch }} \
-              -DCMAKE_C_COMPILER_TARGET=${{ matrix.triple }} \
-              -DCMAKE_CXX_COMPILER_TARGET=${{ matrix.triple }} \
-              -DCMAKE_EXE_LINKER_FLAGS='-static -static-libgcc' \
-              -DLLVM_ENABLE_PIC=OFF \
-              -DBUILD_SHARED_LIBS=OFF \
-              -DLLVM_ENABLE_PROJECTS='clang;lld;clang-tools-extra' \
-              -DLLVM_ENABLE_RUNTIMES='libcxx;libcxxabi' \
-              -DLLVM_ENABLE_LIBCXX=ON \
-              -DLLVM_STATIC_LINK_CXX_STDLIB=ON \
-              -DLIBCXX_STATICALLY_LINK_ABI_IN_STATIC_LIBRARY=ON \
-              -DLIBCXX_ENABLE_STATIC=ON \
-              -DLIBCXX_ENABLE_SHARED=OFF \
-              -DLIBCXXABI_ENABLE_STATIC=ON \
-              -DLIBCXXABI_ENABLE_SHARED=OFF \
-              -DLLVM_INCLUDE_TESTS=OFF \
-              -DLLVM_INCLUDE_EXAMPLES=OFF \
-              -DLLVM_INCLUDE_BENCHMARKS=OFF \
-              -DLLVM_ENABLE_TERMINFO=OFF \
-              -DCLANG_TOOL_CLANG_TIDY_BUILD=ON \
-              -DCLANG_TOOL_CLANG_FORMAT_BUILD=ON \
-              -DLLVM_DEFAULT_TARGET_TRIPLE=${{ matrix.triple }} \
-              -DLLVM_HOST_TRIPLE=${{ matrix.triple }} \
-              -DLLVM_RUNTIME_TARGETS=${{ matrix.triple }} \
-              -C /workspace/llvm-build-cache/projects/runtimes-${{ matrix.triple }}/tmp/runtimes-${{ matrix.triple }}-cache-Release.cmake \
-              -DLIBCXXABI_USE_LLVM_UNWINDER=OFF \
-              -DLIBCXXABI_USE_SYSTEM_UNWINDER=ON
-
-            ninja -j\$(nproc)
-
-            mkdir -p /workspace/static-clang/bin /workspace/static-clang/include /workspace/static-clang/lib
-            cp bin/clang bin/clang++ bin/lld bin/clang-tidy bin/clang-format /workspace/static-clang/bin/
-            cp -r /workspace/llvm-project/libcxx/include /workspace/static-clang/include/libcxx
-            cp -r /workspace/llvm-project/libcxxabi/include /workspace/static-clang/include/libcxxabi
-            find . -name 'libc++.a' -exec cp {} /workspace/static-clang/lib/ \;
-            find . -name 'libc++abi.a' -exec cp {} /workspace/static-clang/lib/ \;
-          "
-
-      # ==================== macOS ====================
-      - name: 编译静态 Clang 并打包 libc++ (macOS)
+      - name: 安装/更新 LLVM 工具链（macOS）
         if: matrix.target_os == 'macos'
         run: |
-          cd ${{ github.workspace }}
-          MAJOR=$(echo '${{ env.LLVM_FULL }}' | cut -d. -f1)
-          if [ -d llvm-project ]; then
-            cd llvm-project
-            git remote set-url origin https://gh-proxy.org/https://github.com/llvm/llvm-project.git
-            git fetch --depth 1 origin release/${MAJOR}.x
-            git checkout release/${MAJOR}.x
-            git submodule update --init --depth 1 clang cmake compiler-rt libcxx libcxxabi lld clang-tools-extra
+          brew update
+          brew install llvm ninja || brew upgrade llvm ninja
+          if [[ "${{ matrix.arch }}" == "arm64" ]]; then
+            echo "/opt/homebrew/opt/llvm/bin" >> $GITHUB_PATH
           else
-            git clone --depth 1 --branch release/${MAJOR}.x https://gh-proxy.org/https://github.com/llvm/llvm-project.git
-            cd llvm-project
-            git submodule update --init --depth 1 clang cmake compiler-rt libcxx libcxxabi lld clang-tools-extra
+            echo "/usr/local/opt/llvm/bin" >> $GITHUB_PATH
           fi
-          cd ${{ github.workspace }}
-          rm -rf llvm-build-cache
-          mkdir -p llvm-build-cache
-          cd llvm-build-cache
-          cmake -G Ninja ../llvm-project/llvm \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_C_COMPILER=clang \
-            -DCMAKE_CXX_COMPILER=clang++ \
-            -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 \
-            -DLLVM_ENABLE_PROJECTS='clang;lld;clang-tools-extra' \
-            -DLLVM_ENABLE_RUNTIMES='libcxx;libcxxabi' \
-            -DLLVM_ENABLE_LIBCXX=ON \
-            -DLLVM_STATIC_LINK_CXX_STDLIB=ON \
-            -DLIBCXX_STATICALLY_LINK_ABI_IN_STATIC_LIBRARY=ON \
-            -DLIBCXX_ENABLE_STATIC=ON \
-            -DLIBCXX_ENABLE_SHARED=OFF \
-            -DLIBCXXABI_ENABLE_STATIC=ON \
-            -DLIBCXXABI_ENABLE_SHARED=OFF \
-            -DLLVM_ENABLE_PIC=OFF \
-            -DBUILD_SHARED_LIBS=OFF \
-            -DLLVM_INCLUDE_TESTS=OFF \
-            -DLLVM_INCLUDE_EXAMPLES=OFF \
-            -DLLVM_INCLUDE_BENCHMARKS=OFF \
-            -DLLVM_ENABLE_TERMINFO=OFF \
-            -DCLANG_TOOL_CLANG_TIDY_BUILD=ON \
-            -DCLANG_TOOL_CLANG_FORMAT_BUILD=ON \
-            -DLLVM_DEFAULT_TARGET_TRIPLE=${{ matrix.triple }} \
-            -DLLVM_HOST_TRIPLE=${{ matrix.triple }} \
-            -DLLVM_RUNTIME_TARGETS=${{ matrix.triple }} \
-            -DRUNTIMES_BUILD_ALLOW_DARWIN=ON
-          ninja clang lld clang-tidy clang-format
-          mkdir -p ../static-clang/bin ../static-clang/include ../static-clang/lib
-          cp bin/clang bin/clang++ bin/lld bin/clang-tidy bin/clang-format ../static-clang/bin/
-          cp -r ../llvm-project/libcxx/include ../static-clang/include/libcxx
-          cp -r ../llvm-project/libcxxabi/include ../static-clang/include/libcxxabi
-          find . -name 'libc++.a' -exec cp {} ../static-clang/lib/ \;
-          find . -name 'libc++abi.a' -exec cp {} ../static-clang/lib/ \;
-
-      # ==================== Windows ====================
-      - name: 下载 LLVM 预编译包 (Windows)
-        if: matrix.target_os == 'windows'
-        shell: pwsh
-        run: |
-          $full = "${{ env.LLVM_FULL }}"
-          $proxy = "https://ghproxy.net/"
-          $url = "$proxy/https://github.com/llvm/llvm-project/releases/download/llvmorg-$full/clang+llvm-$full-x86_64-pc-windows-msvc.tar.xz"
-          Write-Host "Downloading $url"
-
-          if (-not (Get-Command aria2c -ErrorAction SilentlyContinue)) {
-            Write-Host "aria2c 未安装，正在通过 Chocolatey 安装..."
-            choco install aria2 -y --limit-output
-            $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
-            if (-not (Get-Command aria2c -ErrorAction SilentlyContinue)) {
-              Write-Warning "aria2c 安装失败，将使用 Invoke-WebRequest 下载"
-              $useAria2 = $false
-            } else {
-              $useAria2 = $true
-            }
-          } else {
-            $useAria2 = $true
-          }
-
-          $attempts = 0
-          do {
-            try {
-              if ($useAria2) {
-                Write-Host "使用 aria2c 多线程下载 (16线程)"
-                aria2c -x 16 -s 16 -k 1M --allow-overwrite=true --out=llvm.tar.xz $url
-              } else {
-                Write-Host "使用 Invoke-WebRequest 下载"
-                Invoke-WebRequest -Uri $url -OutFile llvm.tar.xz -UserAgent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-              }
-              break
-            } catch {
-              $attempts++
-              if ($attempts -ge 3) { throw "下载失败，重试已达上限" }
-              Write-Host "下载失败，重试 $attempts ..."
-              Start-Sleep -Seconds 5
-            }
-          } while ($true)
-
-          if (-not (Test-Path llvm.tar.xz) -or (Get-Item llvm.tar.xz).Length -eq 0) {
-            throw "下载的文件无效或为空"
-          }
-          Write-Host "下载完成，文件大小: $((Get-Item llvm.tar.xz).Length) 字节"
-
-          # 两步解压
-          Write-Host "解压中（两步）..."
-          7z x llvm.tar.xz -y
-          if ($LASTEXITCODE -ne 0) { throw "解压 .xz 失败" }
-          $tarFile = Get-ChildItem -Filter "*.tar" | Select-Object -First 1
-          if (-not $tarFile) { throw "未找到 .tar 文件" }
-          Write-Host "解压 .tar 文件: $($tarFile.Name)"
-          7z x $tarFile.Name -y
-          if ($LASTEXITCODE -ne 0) { throw "解压 .tar 失败" }
-          Write-Host "解压完成"
-
-          $dir = Get-ChildItem -Directory | Where-Object { $_.Name -like "clang+llvm-$full*" } | Select-Object -First 1
-          if (-not $dir) {
-            $dir = Get-ChildItem -Directory -Filter "clang+llvm-*" | Select-Object -First 1
-          }
-          if (-not $dir) {
-            throw "未找到解压后的目录"
-          }
-          Write-Host "找到目录: $($dir.FullName)"
-          Rename-Item -Path $dir.FullName -NewName "llvm-install"
-          $binPath = "$(Get-Location)\llvm-install\bin"
-          Add-Content $env:GITHUB_PATH $binPath
-          echo "CC=clang" | Out-File -FilePath $env:GITHUB_ENV -Append
-          echo "CXX=clang++" | Out-File -FilePath $env:GITHUB_ENV -Append
-
-      - name: 设置 MSVC 环境 (Windows)
-        if: matrix.target_os == 'windows'
-        uses: ilammy/msvc-dev-cmd@v1
-
-      - name: 编译静态 Clang 并打包 libc++ (Windows)
-        if: matrix.target_os == 'windows'
+          clang --version
         shell: bash
+
+      - name: 安装/更新 LLVM-MinGW 工具链（Windows）
+        if: matrix.target_os == 'windows'
         run: |
-          WORKSPACE="$(cygpath -u "${{ github.workspace }}")"
-          cd "$WORKSPACE"
-          MAJOR=$(echo '${{ env.LLVM_FULL }}' | cut -d. -f1)
-          if [ -d llvm-project ]; then
-            cd llvm-project
-            git remote set-url origin https://gh-proxy.org/https://github.com/llvm/llvm-project.git
-            git fetch --depth 1 origin release/${MAJOR}.x
-            git checkout release/${MAJOR}.x
-            git submodule update --init --depth 1 clang cmake compiler-rt libcxx libcxxabi lld clang-tools-extra
-          else
-            git clone --depth 1 --branch release/${MAJOR}.x https://gh-proxy.org/https://github.com/llvm/llvm-project.git
-            cd llvm-project
-            git submodule update --init --depth 1 clang cmake compiler-rt libcxx libcxxabi lld clang-tools-extra
-          fi
-          cd "$WORKSPACE"
-          rm -rf llvm-build-cache
-          mkdir -p llvm-build-cache
-          cd llvm-build-cache
+          choco list llvm-mingw --local-only --limit-output || choco install llvm-mingw -y
+          choco upgrade llvm-mingw -y
+          choco install ninja -y
+          $mingw_path = (Get-ChildItem -Path "C:\ProgramData\chocolatey\lib\llvm-mingw" -Directory | Select-Object -First 1).FullName
+          if ($mingw_path) {
+            $bin_path = Join-Path $mingw_path "bin"
+            if (Test-Path $bin_path) {
+              echo "$bin_path" >> $env:GITHUB_PATH
+            }
+          }
+          clang --version
+        shell: pwsh
 
-          # Windows 使用指定目标（避免重复规则），并关闭 libclang 构建
-          cmake -G Ninja ../llvm-project/llvm \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_C_COMPILER=clang \
-            -DCMAKE_CXX_COMPILER=clang++ \
-            -DCMAKE_C_COMPILER_TARGET=${{ matrix.triple }} \
-            -DCMAKE_CXX_COMPILER_TARGET=${{ matrix.triple }} \
-            -DCMAKE_MSVC_RUNTIME_LIBRARY="MultiThreaded" \
-            -DLLVM_ENABLE_PIC=OFF \
-            -DBUILD_SHARED_LIBS=OFF \
-            -DLLVM_ENABLE_PROJECTS='clang;lld;clang-tools-extra' \
-            -DLLVM_ENABLE_RUNTIMES='libcxx;libcxxabi' \
-            -DLLVM_ENABLE_LIBCXX=ON \
-            -DLLVM_STATIC_LINK_CXX_STDLIB=ON \
-            -DLIBCXX_STATICALLY_LINK_ABI_IN_STATIC_LIBRARY=ON \
-            -DLIBCXX_ENABLE_STATIC=ON \
-            -DLIBCXX_ENABLE_SHARED=OFF \
-            -DLIBCXXABI_ENABLE_STATIC=ON \
-            -DLIBCXXABI_ENABLE_SHARED=OFF \
-            -DCLANG_BUILD_LIBS=OFF \
-            -DLLVM_INCLUDE_TESTS=OFF \
-            -DLLVM_INCLUDE_EXAMPLES=OFF \
-            -DLLVM_INCLUDE_BENCHMARKS=OFF \
-            -DLLVM_ENABLE_TERMINFO=OFF \
-            -DCLANG_TOOL_CLANG_TIDY_BUILD=ON \
-            -DCLANG_TOOL_CLANG_FORMAT_BUILD=ON \
-            -DLLVM_DEFAULT_TARGET_TRIPLE=${{ matrix.triple }} \
-            -DLLVM_HOST_TRIPLE=${{ matrix.triple }} \
-            -DLLVM_RUNTIME_TARGETS=${{ matrix.triple }}
-
-          # 仅构建我们需要的工具（避免构建 libclang 库相关的冲突）
-          ninja clang lld clang-tidy clang-format
-
-          mkdir -p ../static-clang/bin ../static-clang/include ../static-clang/lib
-          cp bin/clang.exe bin/clang++.exe bin/lld.exe bin/clang-tidy.exe bin/clang-format.exe ../static-clang/bin/
-          cp -r ../llvm-project/libcxx/include ../static-clang/include/libcxx
-          cp -r ../llvm-project/libcxxabi/include ../static-clang/include/libcxxabi
-          find . -name 'libc++.lib' -exec cp {} ../static-clang/lib/ \;
-          find . -name 'libc++abi.lib' -exec cp {} ../static-clang/lib/ \;
-
-      # ==================== 打包 ====================
-      - name: 打包完整目录
-        run: tar -czf clang-${{ matrix.target }}.tar.gz -C static-clang .
-
-      # ==================== 部署 ====================
-      - name: 拉取 StaticClangPool 仓库（Majority 分支）
-        uses: actions/checkout@v4
-        with:
-          repository: Com-Group/StaticClangPool
-          ref: Majority
-          token: ${{ secrets.REPO_ACCESS_TOKEN }}
-          lfs: true
-          path: deploy-repo
-
-      - name: 解压并提交（修复 LFS 问题）
+      # --------------------------------------------
+      # 3. 下载 LLVM 源代码（指定版本）
+      # --------------------------------------------
+      - name: 克隆 LLVM 项目
         run: |
-          cd deploy-repo
-          mkdir -p Clang/${{ matrix.target }}
-          tar -xzf ../clang-${{ matrix.target }}.tar.gz -C Clang/${{ matrix.target }}
+          VERSION="${{ github.event.inputs.llvm_version }}"
+          LLVM_TAG="llvmorg-${VERSION}"
+          echo "克隆标签: $LLVM_TAG"
+          git clone --depth 1 --branch "$LLVM_TAG" https://github.com/llvm/llvm-project.git llvm-project
+          cd llvm-project
+          git describe --tags --always
+        shell: bash
 
-          # 安装 LFS
-          git lfs install
+      # --------------------------------------------
+      # 4. （仅 Linux）下载 musl libc 源码
+      # --------------------------------------------
+      - name: 下载 musl libc 源码（Linux）
+        if: matrix.target_os == 'linux'
+        run: |
+          git clone https://git.musl-libc.org/git/musl musl
+          cd musl && git describe --tags --always
+        shell: bash
 
-          # 设置 LFS 跟踪
-          git lfs track "*.exe" "*.a" "*.lib" "*.dll" "*.so" "*.dylib"
+      # --------------------------------------------
+      # 5. 构建 LLVM 并安装到全新空目录
+      #     如果为 macOS，则设置最低部署目标
+      # --------------------------------------------
+      - name: 构建 LLVM (使用 libc++ 作为标准库)
+        run: |
+          INSTALL_DIR="$PWD/install"
+          echo "安装目录: $INSTALL_DIR"
+          rm -rf "$INSTALL_DIR"
+          mkdir -p "$INSTALL_DIR"
 
-          # 如果有旧的大文件被误存为普通文件，先从索引中移除（保留工作区文件）
-          # 这里我们直接重新添加，不依赖 migrate
-          git rm -r --cached Clang/ || true
-          git add Clang/ .gitattributes
+          mkdir build && cd build
 
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          CMAKE_ARGS=(
+            -G Ninja
+            -DCMAKE_BUILD_TYPE=Release
+            -DLLVM_ENABLE_PROJECTS="clang;libcxx;libcxxabi;clang-tools-extra"
+            -DLLVM_ENABLE_RUNTIMES="libcxx;libcxxabi"
+            -DLLVM_TARGETS_TO_BUILD="host"
+            -DCMAKE_INSTALL_PREFIX="$INSTALL_DIR"
+            -DLLVM_INCLUDE_BENCHMARKS=OFF
+            -DLLVM_INCLUDE_TESTS=OFF
+            -DLLVM_INCLUDE_EXAMPLES=OFF
+            -DLLVM_INCLUDE_DOCS=OFF
+            -DCLANG_DEFAULT_CXX_STDLIB=libc++
+            -DLIBCXX_ENABLE_STATIC_ABI_LIBRARY=ON
+            -DLIBCXX_USE_COMPILER_RT=OFF
+            -DLIBCXXABI_USE_COMPILER_RT=OFF
+            -DCMAKE_CXX_STANDARD=17
+            -DCMAKE_C_STANDARD=11
+          )
 
-          if git diff --staged --quiet; then
-            echo "无变化，跳过提交"
-          else
-            git commit -m "[skip ci] 更新 Clang ${{ env.LLVM_FULL }} - ${{ matrix.target }}（统一Clang + libc++）"
-            # 因为我们已经清除了索引中的大文件，并用 LFS 重新添加，无需强制推送
-            git push
+          # 平台特定设置
+          if [[ "${{ matrix.target_os }}" == "linux" ]]; then
+            CMAKE_ARGS+=(-DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++)
+          elif [[ "${{ matrix.target_os }}" == "macos" ]]; then
+            # macOS 设置最低部署目标
+            DEPLOY_TARGET="${{ github.event.inputs.macos_deployment_target }}"
+            export MACOSX_DEPLOYMENT_TARGET="$DEPLOY_TARGET"
+            CMAKE_ARGS+=(
+              -DCMAKE_C_COMPILER=clang
+              -DCMAKE_CXX_COMPILER=clang++
+              -DCMAKE_OSX_DEPLOYMENT_TARGET="$DEPLOY_TARGET"
+            )
+          elif [[ "${{ matrix.target_os }}" == "windows" ]]; then
+            CMAKE_ARGS+=(
+              -DCMAKE_C_COMPILER=clang
+              -DCMAKE_CXX_COMPILER=clang++
+              -DCMAKE_SYSTEM_NAME=Windows
+              -DCMAKE_SYSTEM_PROCESSOR=${{ matrix.arch }}
+              -DLLVM_DEFAULT_TARGET_TRIPLE=${{ matrix.triple }}
+            )
           fi
 
-      - name: 上传构建产物（可选）
-        uses: actions/upload-artifact@v4
+          cmake "${CMAKE_ARGS[@]}" ../llvm-project/llvm
+          ninja -j$(nproc 2>/dev/null || echo 2) install
+        shell: bash
+
+      # --------------------------------------------
+      # 6. 验证安装
+      # --------------------------------------------
+      - name: 列出安装的工具并测试版本
+        run: |
+          INSTALL_DIR="$PWD/install"
+          ls -la "$INSTALL_DIR/bin/"
+          "$INSTALL_DIR/bin/clang" --version || echo "Clang 未找到"
+        shell: bash
+
+      # --------------------------------------------
+      # 7. （可选）安装项目依赖（示例）
+      # --------------------------------------------
+      - name: 安装项目依赖（npm）
+        run: npm ci
+        shell: bash
+
+      # --------------------------------------------
+      # 8. 使用新编译的 Clang 执行构建（示例）
+      # --------------------------------------------
+      - name: 执行构建
+        run: |
+          INSTALL_DIR="$PWD/install"
+          export PATH="$INSTALL_DIR/bin:$PATH"
+          echo "当前目标: ${{ matrix.target }}"
+          echo "架构: ${{ matrix.arch }}"
+          echo "三元组: ${{ matrix.triple }}"
+          echo "目标 OS: ${{ matrix.target_os }}"
+          clang --version
+          npm run build   # 替换为实际构建命令
+        shell: bash
+
+      # --------------------------------------------
+      # 9. 打包 install 目录为压缩包
+      # --------------------------------------------
+      - name: 打包工具链
+        run: |
+          case "${{ matrix.arch }}" in
+            x86_64)
+              ARCH_NAME="x86"
+              ;;
+            aarch64|arm64)
+              ARCH_NAME="ARM"
+              ;;
+            riscv64)
+              ARCH_NAME="RISC-V"
+              ;;
+            *)
+              ARCH_NAME="${{ matrix.arch }}"
+              ;;
+          esac
+          case "${{ matrix.target_os }}" in
+            linux)
+              OS_NAME="Linux"
+              ;;
+            macos)
+              OS_NAME="macOS"
+              ;;
+            windows)
+              OS_NAME="Windows"
+              ;;
+            *)
+              OS_NAME="${{ matrix.target_os }}"
+              ;;
+          esac
+          BIT="64-bit"
+          PACKAGE_NAME="StaticClangChain--${BIT}--${ARCH_NAME}--${OS_NAME}.tar.gz"
+          echo "压缩包名称: $PACKAGE_NAME"
+          echo "PACKAGE_NAME=$PACKAGE_NAME" >> $GITHUB_ENV
+          tar czf "$PACKAGE_NAME" -C "$PWD" install/
+        shell: bash
+
+      # --------------------------------------------
+      # 10. 上传到 GitHub Release
+      # --------------------------------------------
+      - name: 上传至 Release
+        uses: softprops/action-gh-release@v2
         with:
-          name: clang-${{ matrix.target }}
-          path: clang-${{ matrix.target }}.tar.gz
+          tag_name: "StaticClang-${{ github.event.inputs.llvm_version }}"
+          name: "StaticClang-${{ github.event.inputs.llvm_version }}"
+          files: ${{ env.PACKAGE_NAME }}
+          draft: false
+          prerelease: false
+          generate_release_notes: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
