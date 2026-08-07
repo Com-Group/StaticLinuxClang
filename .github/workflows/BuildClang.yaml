@@ -71,6 +71,7 @@ jobs:
             export CC=clang
             export CXX=clang++
 
+            # 注意：将 -DLIBCXXABI_USE_* 放在 -C 之后，确保覆盖缓存
             cmake -G Ninja /workspace/llvm-project/llvm \
               -DCMAKE_BUILD_TYPE=Release \
               -DCMAKE_C_COMPILER=clang \
@@ -91,10 +92,6 @@ jobs:
               -DLIBCXX_ENABLE_SHARED=OFF \
               -DLIBCXXABI_ENABLE_STATIC=ON \
               -DLIBCXXABI_ENABLE_SHARED=OFF \
-              -DLIBCXXABI_USE_LLVM_UNWINDER=OFF \
-              -DLIBCXXABI_USE_SYSTEM_UNWINDER=ON \
-              -DRUNTIMES_LIBCXXABI_USE_LLVM_UNWINDER=OFF \
-              -DRUNTIMES_LIBCXXABI_USE_SYSTEM_UNWINDER=ON \
               -DLLVM_INCLUDE_TESTS=OFF \
               -DLLVM_INCLUDE_EXAMPLES=OFF \
               -DLLVM_INCLUDE_BENCHMARKS=OFF \
@@ -103,7 +100,10 @@ jobs:
               -DCLANG_TOOL_CLANG_FORMAT_BUILD=ON \
               -DLLVM_DEFAULT_TARGET_TRIPLE=${{ matrix.triple }} \
               -DLLVM_HOST_TRIPLE=${{ matrix.triple }} \
-              -DLLVM_RUNTIME_TARGETS=${{ matrix.triple }}
+              -DLLVM_RUNTIME_TARGETS=${{ matrix.triple }} \
+              -C /workspace/llvm-build-cache/projects/runtimes-${{ matrix.triple }}/tmp/runtimes-${{ matrix.triple }}-cache-Release.cmake \
+              -DLIBCXXABI_USE_LLVM_UNWINDER=OFF \
+              -DLIBCXXABI_USE_SYSTEM_UNWINDER=ON
 
             ninja -j\$(nproc)
 
@@ -218,16 +218,13 @@ jobs:
           }
           Write-Host "下载完成，文件大小: $((Get-Item llvm.tar.xz).Length) 字节"
 
-          # ----- 使用两步解压（避免管道问题） -----
+          # 两步解压
           Write-Host "解压中（两步）..."
-          # 先解压 .xz 得到 .tar
           7z x llvm.tar.xz -y
           if ($LASTEXITCODE -ne 0) { throw "解压 .xz 失败" }
-          # 找到 .tar 文件
           $tarFile = Get-ChildItem -Filter "*.tar" | Select-Object -First 1
           if (-not $tarFile) { throw "未找到 .tar 文件" }
           Write-Host "解压 .tar 文件: $($tarFile.Name)"
-          # 解压 .tar
           7z x $tarFile.Name -y
           if ($LASTEXITCODE -ne 0) { throw "解压 .tar 失败" }
           Write-Host "解压完成"
@@ -272,6 +269,8 @@ jobs:
           rm -rf llvm-build-cache
           mkdir -p llvm-build-cache
           cd llvm-build-cache
+
+          # Windows 使用指定目标（避免重复规则），并关闭 libclang 构建
           cmake -G Ninja ../llvm-project/llvm \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_COMPILER=clang \
@@ -290,6 +289,7 @@ jobs:
             -DLIBCXX_ENABLE_SHARED=OFF \
             -DLIBCXXABI_ENABLE_STATIC=ON \
             -DLIBCXXABI_ENABLE_SHARED=OFF \
+            -DCLANG_BUILD_LIBS=OFF \
             -DLLVM_INCLUDE_TESTS=OFF \
             -DLLVM_INCLUDE_EXAMPLES=OFF \
             -DLLVM_INCLUDE_BENCHMARKS=OFF \
@@ -299,8 +299,10 @@ jobs:
             -DLLVM_DEFAULT_TARGET_TRIPLE=${{ matrix.triple }} \
             -DLLVM_HOST_TRIPLE=${{ matrix.triple }} \
             -DLLVM_RUNTIME_TARGETS=${{ matrix.triple }}
-          NPROC=$(nproc 2>/dev/null || echo 4)
-          ninja -j$NPROC
+
+          # 仅构建我们需要的工具（避免构建 libclang 库相关的冲突）
+          ninja clang lld clang-tidy clang-format
+
           mkdir -p ../static-clang/bin ../static-clang/include ../static-clang/lib
           cp bin/clang.exe bin/clang++.exe bin/lld.exe bin/clang-tidy.exe bin/clang-format.exe ../static-clang/bin/
           cp -r ../llvm-project/libcxx/include ../static-clang/include/libcxx
@@ -322,47 +324,32 @@ jobs:
           lfs: true
           path: deploy-repo
 
-      - name: 解压并提交（保持 bin、include、lib 结构）
+      - name: 解压并提交（修复 LFS 问题）
         run: |
           cd deploy-repo
           mkdir -p Clang/${{ matrix.target }}
           tar -xzf ../clang-${{ matrix.target }}.tar.gz -C Clang/${{ matrix.target }}
 
-          # 确保 git-lfs 是最新版本
-          if [[ "${{ matrix.target_os }}" == "macos" ]]; then
-            brew upgrade git-lfs || brew install git-lfs
-          fi
+          # 安装 LFS
           git lfs install
 
-          # 设置 LFS 跟踪规则（在添加文件之前）
+          # 设置 LFS 跟踪
           git lfs track "*.exe" "*.a" "*.lib" "*.dll" "*.so" "*.dylib"
 
-          # 添加文件
+          # 如果有旧的大文件被误存为普通文件，先从索引中移除（保留工作区文件）
+          # 这里我们直接重新添加，不依赖 migrate
+          git rm -r --cached Clang/ || true
           git add Clang/ .gitattributes
-
-          # 如果历史中有大文件，使用 migrate（不加 --force，旧版本可能不支持）
-          # 但为了兼容性，我们直接强制迁移所有已跟踪的文件（如果支持）
-          if git lfs migrate --help 2>&1 | grep -q import; then
-            echo "执行 git lfs migrate import"
-            git lfs migrate import --include="*.exe,*.a,*.lib,*.dll,*.so,*.dylib" || true
-          else
-            echo "git lfs migrate 不可用，跳过迁移"
-          fi
 
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # 检查是否有变更
           if git diff --staged --quiet; then
             echo "无变化，跳过提交"
           else
             git commit -m "[skip ci] 更新 Clang ${{ env.LLVM_FULL }} - ${{ matrix.target }}（统一Clang + libc++）"
-            # 由于 migrate 可能重写历史，我们使用 --force 推送，但如果不用 migrate，则不用 force
-            if git lfs migrate --help 2>&1 | grep -q import; then
-              git push --force
-            else
-              git push
-            fi
+            # 因为我们已经清除了索引中的大文件，并用 LFS 重新添加，无需强制推送
+            git push
           fi
 
       - name: 上传构建产物（可选）
