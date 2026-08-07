@@ -15,7 +15,7 @@ jobs:
   build:
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 360
+    timeout-minutes: 420
     strategy:
       fail-fast: false
       matrix:
@@ -93,6 +93,8 @@ jobs:
               -DLIBCXXABI_ENABLE_SHARED=OFF \
               -DLIBCXXABI_USE_LLVM_UNWINDER=OFF \
               -DLIBCXXABI_USE_SYSTEM_UNWINDER=ON \
+              -DRUNTIMES_LIBCXXABI_USE_LLVM_UNWINDER=OFF \
+              -DRUNTIMES_LIBCXXABI_USE_SYSTEM_UNWINDER=ON \
               -DLLVM_INCLUDE_TESTS=OFF \
               -DLLVM_INCLUDE_EXAMPLES=OFF \
               -DLLVM_INCLUDE_BENCHMARKS=OFF \
@@ -216,23 +218,18 @@ jobs:
           }
           Write-Host "下载完成，文件大小: $((Get-Item llvm.tar.xz).Length) 字节"
 
-          # 使用 7z 解压
-          $7zPath = (Get-Command 7z -ErrorAction SilentlyContinue).Source
-          if (-not $7zPath) {
-            Write-Host "7z 未安装，正在通过 Chocolatey 安装..."
-            choco install 7zip -y --limit-output
-            $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
-            $7zPath = (Get-Command 7z -ErrorAction SilentlyContinue).Source
-            if (-not $7zPath) {
-              throw "7z 安装失败，无法解压"
-            }
-          }
-          Write-Host "使用 7z 解压 (路径: $7zPath)"
-          Write-Host "解压中..."
-          & $7zPath x llvm.tar.xz -so | & $7zPath x -si -ttar -o. -y
-          if ($LASTEXITCODE -ne 0) {
-            throw "解压失败，退出码: $LASTEXITCODE"
-          }
+          # ----- 使用两步解压（避免管道问题） -----
+          Write-Host "解压中（两步）..."
+          # 先解压 .xz 得到 .tar
+          7z x llvm.tar.xz -y
+          if ($LASTEXITCODE -ne 0) { throw "解压 .xz 失败" }
+          # 找到 .tar 文件
+          $tarFile = Get-ChildItem -Filter "*.tar" | Select-Object -First 1
+          if (-not $tarFile) { throw "未找到 .tar 文件" }
+          Write-Host "解压 .tar 文件: $($tarFile.Name)"
+          # 解压 .tar
+          7z x $tarFile.Name -y
+          if ($LASTEXITCODE -ne 0) { throw "解压 .tar 失败" }
           Write-Host "解压完成"
 
           $dir = Get-ChildItem -Directory | Where-Object { $_.Name -like "clang+llvm-$full*" } | Select-Object -First 1
@@ -331,23 +328,41 @@ jobs:
           mkdir -p Clang/${{ matrix.target }}
           tar -xzf ../clang-${{ matrix.target }}.tar.gz -C Clang/${{ matrix.target }}
 
+          # 确保 git-lfs 是最新版本
+          if [[ "${{ matrix.target_os }}" == "macos" ]]; then
+            brew upgrade git-lfs || brew install git-lfs
+          fi
           git lfs install
+
+          # 设置 LFS 跟踪规则（在添加文件之前）
           git lfs track "*.exe" "*.a" "*.lib" "*.dll" "*.so" "*.dylib"
 
+          # 添加文件
           git add Clang/ .gitattributes
 
-          # 强制迁移大文件到 LFS（解决历史问题）
-          echo "正在将大文件迁移到 LFS..."
-          git lfs migrate import --include="*.exe,*.a,*.lib,*.dll,*.so,*.dylib" --force
+          # 如果历史中有大文件，使用 migrate（不加 --force，旧版本可能不支持）
+          # 但为了兼容性，我们直接强制迁移所有已跟踪的文件（如果支持）
+          if git lfs migrate --help 2>&1 | grep -q import; then
+            echo "执行 git lfs migrate import"
+            git lfs migrate import --include="*.exe,*.a,*.lib,*.dll,*.so,*.dylib" || true
+          else
+            echo "git lfs migrate 不可用，跳过迁移"
+          fi
 
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
+          # 检查是否有变更
           if git diff --staged --quiet; then
             echo "无变化，跳过提交"
           else
             git commit -m "[skip ci] 更新 Clang ${{ env.LLVM_FULL }} - ${{ matrix.target }}（统一Clang + libc++）"
-            git push --force
+            # 由于 migrate 可能重写历史，我们使用 --force 推送，但如果不用 migrate，则不用 force
+            if git lfs migrate --help 2>&1 | grep -q import; then
+              git push --force
+            else
+              git push
+            fi
           fi
 
       - name: 上传构建产物（可选）
