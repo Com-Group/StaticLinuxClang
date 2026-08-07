@@ -19,9 +19,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { target: linux-x86_64, runner: ubuntu-24.04, arch: x86_64, triple: x86_64-alpine-linux-musl, target_os: linux }
-          - { target: linux-aarch64, runner: ubuntu-24.04-arm, arch: aarch64, triple: aarch64-alpine-linux-musl, target_os: linux }
-          - { target: linux-riscv64, runner: ubuntu-24.04-riscv, arch: riscv64, triple: riscv64-alpine-linux-musl, target_os: linux }
+          - { target: linux-x86_64, runner: ubuntu-24.04, arch: x86_64, triple: x86_64-linux-musl, target_os: linux }
+          - { target: linux-aarch64, runner: ubuntu-24.04-arm, arch: aarch64, triple: aarch64-linux-musl, target_os: linux }
+          - { target: linux-riscv64, runner: ubuntu-24.04-riscv, arch: riscv64, triple: riscv64-linux-musl, target_os: linux }
           - { target: macos-x86_64, runner: macos-13, arch: x86_64, triple: x86_64-apple-darwin, target_os: macos }
           - { target: macos-arm64, runner: macos-14, arch: arm64, triple: arm64-apple-darwin, target_os: macos }
           - { target: windows-x86_64, runner: windows-2022, arch: x86_64, triple: x86_64-pc-windows-msvc, target_os: windows }
@@ -31,8 +31,7 @@ jobs:
         uses: actions/checkout@v4
 
       # --------------------------------------------
-      # 1. 安装 Node.js（仅当存在 package.json 时）
-      #    不启用自动缓存，避免因缺少 lock 文件报错
+      # 1. 安装 Node.js（仅当存在 package.json）
       # --------------------------------------------
       - name: 安装 Node.js (LTS)
         if: hashFiles('package.json') != ''
@@ -81,7 +80,7 @@ jobs:
         shell: pwsh
 
       # --------------------------------------------
-      # 3. 下载 LLVM 源代码（指定版本）
+      # 3. 下载 LLVM 源代码
       # --------------------------------------------
       - name: 克隆 LLVM 项目
         run: |
@@ -94,33 +93,47 @@ jobs:
         shell: bash
 
       # --------------------------------------------
-      # 4. （仅 Linux）下载 musl libc 源码
+      # 4. （仅 Linux）编译 musl libc 并安装为 sysroot
       # --------------------------------------------
-      - name: 下载 musl libc 源码（Linux）
+      - name: 构建 musl libc（Linux）
         if: matrix.target_os == 'linux'
         run: |
-          git clone https://git.musl-libc.org/git/musl musl
-          cd musl && git describe --tags --always
+          echo "--- 下载 musl 源码 ---"
+          git clone https://git.musl-libc.org/git/musl musl-src
+          cd musl-src
+          echo "--- 配置 musl（安装到 $PWD/../musl-sysroot/usr） ---"
+          ./configure --prefix=/usr --disable-shared  # 仅静态库，便于封装
+          make -j$(nproc)
+          # 安装到 musl-sysroot 目录，结构为 usr/include, usr/lib 等
+          make install DESTDIR="$PWD/../musl-sysroot"
+          cd ..
+          echo "musl 安装完成，sysroot 位于: $PWD/musl-sysroot"
         shell: bash
 
       # --------------------------------------------
-      # 5. 构建 LLVM（修正后的 CMake 参数）
+      # 5. 构建 LLVM（使用 musl 作为默认 libc）
       # --------------------------------------------
-      - name: 构建 LLVM (使用 libc++ 作为标准库)
+      - name: 构建 LLVM（默认使用 musl）
         run: |
           INSTALL_DIR="$PWD/install"
           echo "安装目录: $INSTALL_DIR"
           rm -rf "$INSTALL_DIR"
           mkdir -p "$INSTALL_DIR"
 
+          # 设置 sysroot（仅 Linux）
+          if [[ "${{ matrix.target_os }}" == "linux" ]]; then
+            SYSROOT="$PWD/musl-sysroot"
+            echo "使用 musl sysroot: $SYSROOT"
+          else
+            SYSROOT=""
+          fi
+
           mkdir build && cd build
 
           CMAKE_ARGS=(
             -G Ninja
             -DCMAKE_BUILD_TYPE=Release
-            # 仅将 clang 和 clang-tools-extra 作为项目
             -DLLVM_ENABLE_PROJECTS="clang;clang-tools-extra"
-            # libcxx 和 libcxxabi 作为运行时
             -DLLVM_ENABLE_RUNTIMES="libcxx;libcxxabi"
             -DLLVM_TARGETS_TO_BUILD="host"
             -DCMAKE_INSTALL_PREFIX="$INSTALL_DIR"
@@ -137,7 +150,20 @@ jobs:
           )
 
           if [[ "${{ matrix.target_os }}" == "linux" ]]; then
-            CMAKE_ARGS+=(-DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++)
+            # 使用系统 clang 编译，但指定目标为 musl 三元组
+            CMAKE_ARGS+=(
+              -DCMAKE_C_COMPILER=clang
+              -DCMAKE_CXX_COMPILER=clang++
+              -DLLVM_DEFAULT_TARGET_TRIPLE="${{ matrix.triple }}"
+              -DCMAKE_SYSROOT="$SYSROOT"
+              # 强制使用 musl 的库和头文件
+              -DC_INCLUDE_DIRS="$SYSROOT/usr/include"
+              -DCXX_INCLUDE_DIRS="$SYSROOT/usr/include/c++/v1"  # libc++ 头文件仍来自 LLVM，但这里我们用 musl 的 C 头文件
+            )
+            # 注意：libc++ 的编译会依赖 glibc 头文件？我们需要确保 libc++ 编译时使用 musl 的 sysroot
+            # 可以额外传递 -DCMAKE_CXX_FLAGS="--sysroot=$SYSROOT" 等
+            export CFLAGS="--sysroot=$SYSROOT"
+            export CXXFLAGS="--sysroot=$SYSROOT"
           elif [[ "${{ matrix.target_os }}" == "macos" ]]; then
             DEPLOY_TARGET="${{ github.event.inputs.macos_deployment_target }}"
             export MACOSX_DEPLOYMENT_TARGET="$DEPLOY_TARGET"
@@ -161,27 +187,27 @@ jobs:
         shell: bash
 
       # --------------------------------------------
-      # 6. 验证安装
+      # 6. 验证安装（查看新 clang 的默认 target）
       # --------------------------------------------
-      - name: 列出安装的工具并测试版本
+      - name: 验证 Clang 默认 target 和 sysroot
         run: |
           INSTALL_DIR="$PWD/install"
-          ls -la "$INSTALL_DIR/bin/"
-          "$INSTALL_DIR/bin/clang" --version || echo "Clang 未找到"
+          "$INSTALL_DIR/bin/clang" --version
+          echo "--- 默认目标三元组 ---"
+          "$INSTALL_DIR/bin/clang" -dumpmachine || echo "无法获取"
+          echo "--- 搜索路径 ---"
+          "$INSTALL_DIR/bin/clang" -print-search-dirs || echo "无法获取"
         shell: bash
 
       # --------------------------------------------
-      # 7. （可选）安装项目依赖（仅当 package.json 存在）
+      # 7. （可选）npm 安装及构建
       # --------------------------------------------
       - name: 安装项目依赖（npm）
         if: hashFiles('package.json') != ''
         run: npm ci
         shell: bash
 
-      # --------------------------------------------
-      # 8. 使用新编译的 Clang 执行构建（仅当 package.json 存在）
-      # --------------------------------------------
-      - name: 执行构建
+      - name: 执行构建（npm）
         if: hashFiles('package.json') != ''
         run: |
           INSTALL_DIR="$PWD/install"
@@ -189,43 +215,26 @@ jobs:
           echo "当前目标: ${{ matrix.target }}"
           echo "架构: ${{ matrix.arch }}"
           echo "三元组: ${{ matrix.triple }}"
-          echo "目标 OS: ${{ matrix.target_os }}"
           clang --version
-          npm run build   # 替换为实际构建命令
+          npm run build
         shell: bash
 
       # --------------------------------------------
-      # 9. 打包 install 目录为压缩包
+      # 8. 打包并上传 Release
       # --------------------------------------------
       - name: 打包工具链
         run: |
           case "${{ matrix.arch }}" in
-            x86_64)
-              ARCH_NAME="x86"
-              ;;
-            aarch64|arm64)
-              ARCH_NAME="ARM"
-              ;;
-            riscv64)
-              ARCH_NAME="RISC-V"
-              ;;
-            *)
-              ARCH_NAME="${{ matrix.arch }}"
-              ;;
+            x86_64) ARCH_NAME="x86" ;;
+            aarch64|arm64) ARCH_NAME="ARM" ;;
+            riscv64) ARCH_NAME="RISC-V" ;;
+            *) ARCH_NAME="${{ matrix.arch }}" ;;
           esac
           case "${{ matrix.target_os }}" in
-            linux)
-              OS_NAME="Linux"
-              ;;
-            macos)
-              OS_NAME="macOS"
-              ;;
-            windows)
-              OS_NAME="Windows"
-              ;;
-            *)
-              OS_NAME="${{ matrix.target_os }}"
-              ;;
+            linux) OS_NAME="Linux" ;;
+            macos) OS_NAME="macOS" ;;
+            windows) OS_NAME="Windows" ;;
+            *) OS_NAME="${{ matrix.target_os }}" ;;
           esac
           BIT="64-bit"
           PACKAGE_NAME="StaticClangChain--${BIT}--${ARCH_NAME}--${OS_NAME}.tar.gz"
@@ -234,9 +243,6 @@ jobs:
           tar czf "$PACKAGE_NAME" -C "$PWD" install/
         shell: bash
 
-      # --------------------------------------------
-      # 10. 上传到 GitHub Release
-      # --------------------------------------------
       - name: 上传至 Release
         uses: softprops/action-gh-release@v2
         with:
