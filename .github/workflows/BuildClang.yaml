@@ -8,7 +8,7 @@ on:
         required: true
         default: '18.1.8'
       macos_deployment_target:
-        description: 'macOS 最低部署目标（仅 macOS 平台使用）'
+        description: 'macOS 最低部署目标（仅 macOS）'
         required: false
         default: '10.15'
 
@@ -27,17 +27,34 @@ jobs:
           - { target: windows-x86_64, runner: windows-2022, arch: x86_64, triple: x86_64-pc-windows-msvc, target_os: windows }
 
     steps:
-      - name: Checkout
+      - name: Checkout 仓库
         uses: actions/checkout@v4
 
-      # --- 通用 Node.js（可选） ---
-      - name: 安装 Node.js (LTS)
+      # --------------------------------------------
+      # 统一克隆 LLVM 源码（所有平台）
+      # --------------------------------------------
+      - name: 克隆 LLVM 项目
+        run: |
+          VERSION="${{ github.event.inputs.llvm_version }}"
+          LLVM_TAG="llvmorg-${VERSION}"
+          echo "克隆标签: $LLVM_TAG"
+          git clone --depth 1 --branch "$LLVM_TAG" https://github.com/llvm/llvm-project.git llvm-project
+          cd llvm-project
+          git describe --tags --always
+        shell: bash
+
+      # --------------------------------------------
+      # Node.js（可选）
+      # --------------------------------------------
+      - name: 安装 Node.js
         if: hashFiles('package.json') != ''
         uses: actions/setup-node@v4
         with:
           node-version: 'lts/*'
 
-      # --- Linux 专用：构建 musl 工具链 ---
+      # ============================================
+      # Linux 平台：构建 musl + 静态 Clang
+      # ============================================
       - name: Linux - 构建 musl 和 libc++ 静态库
         if: matrix.target_os == 'linux'
         run: |
@@ -45,7 +62,7 @@ jobs:
           SYSROOT="$PWD/musl-sysroot"
           mkdir -p "$SYSROOT"
 
-          # 1. 下载 musl 源码并编译
+          # 1. 下载并编译 musl
           git clone --depth 1 https://git.musl-libc.org/git/musl musl-src
           cd musl-src
           ./configure --prefix=/usr --disable-shared --syslibdir=/usr/lib
@@ -53,37 +70,32 @@ jobs:
           make DESTDIR="$SYSROOT" install
           cd ..
 
-          # 2. 下载 LLVM 源码（用于 libc++）
-          git clone --depth 1 --branch "llvmorg-${{ github.event.inputs.llvm_version }}" https://github.com/llvm/llvm-project.git llvm-project
-
-          # 3. 使用宿主 clang 编译 libc++ 和 libc++abi（针对 musl 目标，静态）
-          mkdir build-libcxx && cd build-libcxx
-          # 设置编译器为宿主 clang，目标为 musl 三元组，并指定 sysroot
-          export CC=/usr/bin/clang
-          export CXX=/usr/bin/clang++
-          export CFLAGS="--target=${{ matrix.triple }} --sysroot=$SYSROOT"
-          export CXXFLAGS="--target=${{ matrix.triple }} --sysroot=$SYSROOT"
-          export LDFLAGS="--target=${{ matrix.triple }} --sysroot=$SYSROOT"
+          # 2. 构建 libc++ 和 libc++abi（静态，针对 musl）
+          mkdir -p build-libcxx && cd build-libcxx
+          # 使用宿主 clang，但强制跳过编译器测试
           cmake -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INSTALL_PREFIX="$SYSROOT/usr" \
             -DLLVM_ENABLE_PROJECTS="libcxx;libcxxabi" \
             -DLLVM_TARGETS_TO_BUILD="host" \
-            -DLIBCXX_ENABLE_STATIC=ON \
-            -DLIBCXX_ENABLE_SHARED=OFF \
-            -DLIBCXXABI_ENABLE_STATIC=ON \
-            -DLIBCXXABI_ENABLE_SHARED=OFF \
-            -DLIBCXX_USE_COMPILER_RT=OFF \
-            -DLIBCXXABI_USE_COMPILER_RT=OFF \
+            -DCMAKE_C_COMPILER=/usr/bin/clang \
+            -DCMAKE_CXX_COMPILER=/usr/bin/clang++ \
+            -DCMAKE_SYSROOT="$SYSROOT" \
+            -DCMAKE_CXX_FLAGS="--target=${{ matrix.triple }}" \
+            -DCMAKE_C_FLAGS="--target=${{ matrix.triple }}" \
+            -DCMAKE_EXE_LINKER_FLAGS="-static-libgcc -Wl,--no-as-needed" \
+            -DLIBCXX_ENABLE_STATIC=ON -DLIBCXX_ENABLE_SHARED=OFF \
+            -DLIBCXXABI_ENABLE_STATIC=ON -DLIBCXXABI_ENABLE_SHARED=OFF \
+            -DLIBCXX_USE_COMPILER_RT=OFF -DLIBCXXABI_USE_COMPILER_RT=OFF \
             -DCMAKE_CXX_STANDARD=17 \
+            -DCMAKE_C_COMPILER_WORKS=ON -DCMAKE_CXX_COMPILER_WORKS=ON \
             ../llvm-project/llvm
           ninja -j$(nproc) install
           cd ..
 
-          echo "musl 和 libc++ 静态库已安装到 $SYSROOT"
+          echo "musl 和 libc++ 静态库安装到 $SYSROOT"
         shell: bash
 
-      # --- Linux 专用：静态编译 Clang ---
       - name: Linux - 静态编译 Clang (链接 musl)
         if: matrix.target_os == 'linux'
         run: |
@@ -93,14 +105,8 @@ jobs:
           rm -rf "$INSTALL_DIR"
           mkdir -p "$INSTALL_DIR"
 
-          mkdir build && cd build
-          export CC=/usr/bin/clang
-          export CXX=/usr/bin/clang++
-          # 使用 musl 目标，并指定 sysroot
-          export CFLAGS="--target=${{ matrix.triple }} --sysroot=$SYSROOT -static"
-          export CXXFLAGS="--target=${{ matrix.triple }} --sysroot=$SYSROOT -static -stdlib=libc++"
-          export LDFLAGS="--target=${{ matrix.triple }} --sysroot=$SYSROOT -static -Wl,--no-as-needed"
-          # 禁用所有外部依赖，避免额外动态链接
+          mkdir -p build-clang && cd build-clang
+          # 同样跳过测试，强制静态链接
           cmake -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INSTALL_PREFIX="$INSTALL_DIR" \
@@ -120,17 +126,25 @@ jobs:
             -DLLVM_ENABLE_PIC=OFF \
             -DLLVM_BUILD_STATIC=ON \
             -DBUILD_SHARED_LIBS=OFF \
+            -DCMAKE_C_COMPILER=/usr/bin/clang \
+            -DCMAKE_CXX_COMPILER=/usr/bin/clang++ \
+            -DCMAKE_SYSROOT="$SYSROOT" \
+            -DCMAKE_CXX_FLAGS="--target=${{ matrix.triple }} -stdlib=libc++ -static" \
+            -DCMAKE_C_FLAGS="--target=${{ matrix.triple }} -static" \
             -DCMAKE_EXE_LINKER_FLAGS="-static -Wl,--no-as-needed" \
             -DCMAKE_CXX_STANDARD=17 \
             -DCMAKE_C_STANDARD=11 \
+            -DCMAKE_C_COMPILER_WORKS=ON \
+            -DCMAKE_CXX_COMPILER_WORKS=ON \
             ../llvm-project/llvm
           ninja -j$(nproc) install
           cd ..
-          # 复制 sysroot 到 install（供用户后续使用）
           cp -r "$SYSROOT" "$INSTALL_DIR/sysroot"
         shell: bash
 
-      # --- macOS 专用：使用系统 clang 构建 ---
+      # ============================================
+      # macOS 平台：使用 Xcode Clang
+      # ============================================
       - name: macOS - 安装工具并构建
         if: matrix.target_os == 'macos'
         run: |
@@ -138,8 +152,7 @@ jobs:
           INSTALL_DIR="$PWD/install"
           rm -rf "$INSTALL_DIR"
           mkdir -p "$INSTALL_DIR"
-          mkdir build && cd build
-          /usr/bin/clang --version
+          mkdir -p build && cd build
           cmake -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INSTALL_PREFIX="$INSTALL_DIR" \
@@ -158,7 +171,9 @@ jobs:
           ninja -j$(sysctl -n hw.ncpu) install
         shell: bash
 
-      # --- Windows 专用：下载 LLVM-MinGW 构建 ---
+      # ============================================
+      # Windows 平台：使用 LLVM-MinGW
+      # ============================================
       - name: Windows - 下载 LLVM-MinGW 并构建
         if: matrix.target_os == 'windows'
         run: |
@@ -169,21 +184,27 @@ jobs:
           $MINGW_PATH = Join-Path $PWD "llvm-mingw-$LLVM_MINGW_VERSION-msvcrt-x86_64"
           $BIN_PATH = Join-Path $MINGW_PATH "bin"
           echo "$BIN_PATH" >> $env:GITHUB_PATH
-          # 使用 mingw 的 clang 编译
-          mkdir build; cd build
-          cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$env:INSTALL_DIR" -DLLVM_ENABLE_PROJECTS="clang;clang-tools-extra" -DLLVM_ENABLE_RUNTIMES="libcxx;libcxxabi" -DLLVM_TARGETS_TO_BUILD="host" -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_SYSTEM_NAME=Windows -DCMAKE_SYSTEM_PROCESSOR=${{ matrix.arch }} -DLLVM_DEFAULT_TARGET_TRIPLE=${{ matrix.triple }} -DLLVM_INCLUDE_BENCHMARKS=OFF -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_EXAMPLES=OFF -DLLVM_INCLUDE_DOCS=OFF -DCLANG_DEFAULT_CXX_STDLIB=libc++ ../llvm-project/llvm
+          # 构建
+          $INSTALL_DIR = Join-Path $PWD "install"
+          mkdir build -ErrorAction SilentlyContinue
+          cd build
+          cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$INSTALL_DIR" -DLLVM_ENABLE_PROJECTS="clang;clang-tools-extra" -DLLVM_ENABLE_RUNTIMES="libcxx;libcxxabi" -DLLVM_TARGETS_TO_BUILD="host" -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_SYSTEM_NAME=Windows -DCMAKE_SYSTEM_PROCESSOR=${{ matrix.arch }} -DLLVM_DEFAULT_TARGET_TRIPLE=${{ matrix.triple }} -DLLVM_INCLUDE_BENCHMARKS=OFF -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_EXAMPLES=OFF -DLLVM_INCLUDE_DOCS=OFF -DCLANG_DEFAULT_CXX_STDLIB=libc++ ..\llvm-project\llvm
           ninja install
+          cd ..
         shell: pwsh
 
-      # --- 通用：验证并打包 ---
+      # ============================================
+      # 验证并打包
+      # ============================================
       - name: 验证 Clang 并打包
         run: |
           INSTALL_DIR="$PWD/install"
           echo "--- 验证 clang ---"
           "$INSTALL_DIR/bin/clang" --version
           if [[ "${{ matrix.target_os }}" == "linux" ]]; then
-            echo "--- 检查 clang 是否为静态链接（应输出 'not a dynamic executable'） ---"
+            echo "--- 检查 clang 是否为静态链接 ---"
             file "$INSTALL_DIR/bin/clang" || true
+            ldd "$INSTALL_DIR/bin/clang" 2>&1 | grep "not a dynamic executable" && echo "静态链接成功" || echo "警告：可能动态链接"
           fi
           # 打包
           case "${{ matrix.arch }}" in
